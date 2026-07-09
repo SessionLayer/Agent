@@ -1,0 +1,90 @@
+# SessionLayer Agent — the per-node outbound connector (Design §9.2, §9.3).
+#
+# Session One scope is scaffolding ONLY: package, contract codegen, a
+# `--version` surface, non-root posture, quality tooling and CI. No product
+# behaviour (no JoinMethod, no mTLS identity, no dial-back) lives here yet — see
+# CLAUDE.md "Scope".
+#
+# Layout decision: a SINGLE package that is both a library (`sessionlayer_agent`,
+# src/lib.rs) and a thin binary (`sessionlayer-agent`, src/main.rs). The library
+# split keeps the version/negotiation logic unit-testable from an integration
+# test without the build-time cost of a multi-crate workspace on a shared
+# 2-core builder. A workspace (`agent` + `agent-core`) is deferred until there
+# is enough logic to warrant it (S12/S13). Recorded in CLAUDE.md.
+[package]
+name = "sessionlayer-agent"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "SessionLayer Agent — per-node outbound connector for the Zero-Trust SSH platform."
+license = "GPL-3.0-only"
+repository = "https://github.com/SessionLayer/Agent"
+readme = "README.md"
+publish = false
+
+[lib]
+name = "sessionlayer_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sessionlayer-agent"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime — plain multi-threaded tokio. The Agent is a control-plane
+# participant, NOT a hot byte-copy datapath, so tokio-uring is deliberately not
+# used (rationale in CLAUDE.md). Minimal feature set for the scaffold.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros"] }
+
+# Generated protobuf message types (from the vendored common.proto). The
+# `derive` feature provides the `::prost::Message` derive + `#[prost(..)]` helper
+# attributes the generated code relies on.
+prost = { version = "0.13", default-features = false, features = ["std", "derive"] }
+
+# gRPC runtime. The Agent's primary plane to the Gateway is the framed WIRE
+# protocol (contracts/wire/agent-gateway-v1.md), NOT gRPC; tonic is pinned here
+# as the shared Rust gRPC runtime so the contract-first codegen toolchain
+# matches the Gateway/CP and is ready for the CP-adjacent codegen wired in a
+# later session. Re-exported from `grpc` so it is a genuine, tracked dependency
+# and not dead supply-chain weight. default-features off to avoid pulling the
+# heavy transport/hyper stack this session.
+tonic = { version = "0.13", default-features = false, features = ["codegen", "prost"] }
+
+# TLS backend, pinned and installed process-wide at startup (single explicit
+# crypto provider fleet-wide before any TLS is negotiated in S13). ring backend
+# keeps the build lean vs aws-lc-rs; default features off to drop aws-lc-rs.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+
+# Structured logging. Keep tracing-subscriber's default features (fmt, ansi,
+# registry, std, tracing-log) and add env-filter for RUST_LOG control.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Machine-readable version descriptor (`--version-json`, deliverable §6.3.5).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors: thiserror for the library's typed error, anyhow for the binary.
+thiserror = "2"
+anyhow = "1"
+
+# CLI.
+clap = { version = "4", features = ["derive"] }
+
+# Effective-UID probe for the non-root runtime warning (FR-CONN-6). libc is
+# already in the tree transitively via tokio; declaring it directly adds no new
+# distinct crate to the supply chain.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[build-dependencies]
+# Contract codegen: prost/tonic message types from the vendored common.proto.
+tonic-build = { version = "0.13", default-features = false, features = ["prost"] }
+
+[profile.release]
+# Reproducible-build / provenance intent (NFR-7): deterministic, deb"info"-free
+# release artifacts. LTO + single codegen unit for a small, self-contained agent.
+lto = true
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
