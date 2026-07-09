@@ -1,0 +1,55 @@
+# SessionLayer Agent — CI.
+#
+# ONE required job, id `gate`, so the branch-protection required check is
+# literally `gate`. It runs the same scripts/gate.sh used locally and by
+# `make agent-gate`, plus a cheap static assertion of the non-root container
+# posture. All third-party actions are pinned to a full commit SHA (supply-chain
+# hardening, NFR-7); the trailing `# vX.Y.Z` is the human-readable tag.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# Least privilege: the gate only reads the repo.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          protoc --version
+
+      - name: Install Rust toolchain (pinned by rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # pinned commit (action publishes no semver tags)
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@aa7c1c80a07a27a84c0aa76d0cef0aad3830e330 # v2.7.8
+
+      - name: Install cargo-nextest, cargo-deny, cargo-audit (pinned)
+        uses: taiki-e/install-action@7ec692fc37da04f8da31c22ba9f3b71ef267e650 # v2.62.24
+        with:
+          # Pin the supply-chain enforcers themselves so the gate is reproducible
+          # (NFR-7) — bump via reviewed PRs, matching the toolchain/action pins.
+          tool: cargo-nextest@0.9.135,cargo-deny@0.19.6,cargo-audit@0.22.1
+
+      - name: Assert non-root container posture (static)
+        run: ./scripts/check-dockerfile-nonroot.sh
+
+      - name: Gate (fmt, clippy, nextest, audit, deny, findings)
+        run: ./scripts/gate.sh

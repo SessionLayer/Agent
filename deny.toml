@@ -1,0 +1,56 @@
+# cargo-deny policy for the SessionLayer Agent (supply-chain gate, NFR-7).
+# Schema v2 (cargo-deny >= 0.16). Run: `cargo deny check`.
+
+[graph]
+# Evaluate the dependency graph for the platforms we actually ship on.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+]
+all-features = true
+
+[advisories]
+# RustSec advisory DB. Anything with an unignored advisory fails the gate.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# No advisory ignores yet — keep this list empty and justified per entry when
+# it must ever be non-empty.
+ignore = []
+
+[bans]
+# Duplicate versions are a warning (transitive graphs legitimately dup); a
+# wildcard version requirement is an error (non-reproducible).
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+# TLS posture: the platform standardises on rustls. Fail the build if any
+# dependency drags in the C OpenSSL stack, so the crypto backend stays a single,
+# audited, memory-safe choice (defence-in-depth for NFR-7).
+deny = [
+    { name = "openssl", reason = "TLS is rustls-only; no OpenSSL in the tree." },
+    { name = "openssl-sys", reason = "TLS is rustls-only; no OpenSSL in the tree." },
+]
+
+[licenses]
+# Explicit, MINIMAL allow-list — exactly the licenses present in the current
+# dependency tree. Anything outside it fails the gate, so a dependency bump that
+# introduces a new license is forced through review rather than sliding in.
+# GPL-3.0-only is this crate's own license; the permissively-licensed deps are
+# compatible under it.
+confidence-threshold = 0.9
+allow = [
+    "GPL-3.0-only",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "ISC",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+]
+
+[sources]
+# Only the canonical crates.io registry is permitted; no git or alternate
+# registries may enter the build without an explicit, reviewed change here.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

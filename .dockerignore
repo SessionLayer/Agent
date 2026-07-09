@@ -1,0 +1,12 @@
+# Keep the build context minimal and reproducible.
+target/
+.git/
+.github/
+audit/
+scripts/
+dev/
+*.md
+!README.md
+.gitignore
+.dockerignore
+junit.xml

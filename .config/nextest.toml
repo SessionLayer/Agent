@@ -1,0 +1,18 @@
+# cargo-nextest configuration for the SessionLayer Agent.
+# https://nexte.st/docs/configuration/
+[profile.default]
+# Surface slow/hung tests early; the scaffold has no long-running tests.
+slow-timeout = { period = "30s", terminate-after = 2 }
+# Show output for failures immediately.
+failure-output = "immediate-final"
+# Any nextest-level warning (e.g. no tests matched a required filter) is fatal.
+fail-fast = false
+
+[profile.ci]
+# CI mirrors default but retries once to absorb rare infra flakes, and emits a
+# JUnit report for the pipeline.
+retries = 1
+failure-output = "immediate-final"
+
+[profile.ci.junit]
+path = "junit.xml"

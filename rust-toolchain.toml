@@ -1,0 +1,6 @@
+# Pin the toolchain so local, CI, and the container build byte-identically
+# (reproducible-build intent, NFR-7). Channel matches the platform baseline.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
