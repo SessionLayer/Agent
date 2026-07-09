@@ -67,10 +67,12 @@ syscall bottleneck.
 
 `init_process()` installs a single `rustls` crypto provider (**ring**) at
 startup, before any TLS is used, so the whole fleet uses one audited,
-memory-safe backend. `deny.toml` **bans the `openssl`/`openssl-sys` crates** so
-the C OpenSSL stack can never enter the tree. Installing the provider **fails
-closed**: if it cannot be installed the process aborts rather than drift toward
-an unauthenticated transport.
+memory-safe backend. rustls is **TLS 1.3-only** (the `tls12` feature is not
+enabled — both ends of the Agent's plane are first-party, so there is no TLS 1.2
+negotiation/downgrade surface). `deny.toml` **bans the `openssl`/`openssl-sys`
+crates** so the C OpenSSL stack can never enter the tree. Installing the provider
+**fails closed**: if it cannot be installed the process aborts rather than drift
+toward an unauthenticated transport.
 
 ---
 
@@ -167,6 +169,12 @@ building, `ROUND_FINAL` only when clean and the gate passes. Findings are
 Resolved **medium+** findings are **moved to `audit/closed/`** (the ROUND_FINAL
 idle hook counts any medium+ severity file left under `audit/` regardless of
 status). Do not idle in `ROUND_FINAL` with a failing gate.
+
+Session One's red-team pass (`redteam-auditor` + `security-reviewer`) found **no
+medium+ issues**; the nine low/info findings (`audit/F-*.md`) are all
+Verified-Fixed or Accepted-Risk. The two load-bearing follow-ups for later
+sessions: promote `warn_if_root()` to fail-closed once host-key access lands
+(F-privilege-3), and pin base-image digests in the release pipeline (F-docker-2).
 
 ## Supply-chain intent (NFR-7)
 

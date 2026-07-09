@@ -41,19 +41,24 @@ tokio = { version = "1", default-features = false, features = ["rt-multi-thread"
 # attributes the generated code relies on.
 prost = { version = "0.13", default-features = false, features = ["std", "derive"] }
 
-# gRPC runtime. The Agent's primary plane to the Gateway is the framed WIRE
-# protocol (contracts/wire/agent-gateway-v1.md), NOT gRPC; tonic is pinned here
-# as the shared Rust gRPC runtime so the contract-first codegen toolchain
-# matches the Gateway/CP and is ready for the CP-adjacent codegen wired in a
-# later session. Re-exported from `grpc` so it is a genuine, tracked dependency
-# and not dead supply-chain weight. default-features off to avoid pulling the
-# heavy transport/hyper stack this session.
+# gRPC runtime, carried per the Session One baseline-deps directive so the
+# Rust codegen toolchain matches the Gateway/CP. TRADE-OFF (acknowledged, see
+# audit/F-supply-2): the Agent's live plane to the Gateway is the framed WIRE
+# protocol (contracts/wire/agent-gateway-v1.md), NOT gRPC, so tonic has no
+# runtime consumer this session yet still pulls ~10 transitive crates (http,
+# tower-*, base64, ...). default-features off drops the heavy transport/hyper
+# stack; the `grpc` re-export keeps the edge tracked by audit/deny. Revisit
+# slimming to build-only `tonic-build` in the session that wires CP-adjacent
+# codegen if the runtime consumer never materialises.
 tonic = { version = "0.13", default-features = false, features = ["codegen", "prost"] }
 
 # TLS backend, pinned and installed process-wide at startup (single explicit
 # crypto provider fleet-wide before any TLS is negotiated in S13). ring backend
-# keeps the build lean vs aws-lc-rs; default features off to drop aws-lc-rs.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+# keeps the build lean vs aws-lc-rs. TLS 1.3-only by construction: both ends of
+# the Agent's plane are first-party SessionLayer software, so `tls12` is
+# deliberately NOT enabled — this removes all TLS 1.2 negotiation/downgrade
+# surface. Re-add only with a documented interop requirement.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 
 # Structured logging. Keep tracing-subscriber's default features (fmt, ansi,
 # registry, std, tracing-log) and add env-filter for RUST_LOG control.

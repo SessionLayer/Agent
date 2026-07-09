@@ -39,14 +39,16 @@ pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/sessionlayer.controlplane.v1.rs"));
 }
 
-/// The pinned Rust gRPC runtime, re-exported so it is a tracked dependency
-/// rather than dead supply-chain weight.
+/// The pinned Rust gRPC runtime, re-exported so the dependency edge is tracked
+/// by `cargo audit`/`cargo deny`.
 ///
 /// The Agent's live plane to the Gateway is the framed wire protocol
-/// (`contracts/wire/agent-gateway-v1.md`), **not** gRPC, so `tonic` is unused at
-/// runtime this session. It is carried for toolchain symmetry with the Gateway
-/// and Control Plane and is the runtime for the CP-adjacent codegen wired in a
-/// later session. See CLAUDE.md "Dependencies".
+/// (`contracts/wire/agent-gateway-v1.md`), **not** gRPC, so `tonic` has no
+/// runtime consumer this session — it is carried per the Session One
+/// baseline-deps directive for toolchain symmetry with the Gateway/Control
+/// Plane. The re-export makes the edge visible to the supply-chain gate; it does
+/// not remove the transitive surface (see `audit/F-supply-2` and CLAUDE.md
+/// "Dependencies").
 pub mod grpc {
     pub use tonic;
 }

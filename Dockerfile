@@ -32,9 +32,9 @@ COPY proto ./proto
 COPY src ./src
 
 # Build the release binary. cargo runs as the image's default (root) user in the
-# BUILDER stage only — nothing from that context is carried into the runtime.
-RUN cargo build --release --locked --bin sessionlayer-agent \
- && strip /build/target/release/sessionlayer-agent || true
+# BUILDER stage only — nothing from that context is carried into the runtime. The
+# binary is already stripped via `[profile.release] strip = "symbols"`.
+RUN cargo build --release --locked --bin sessionlayer-agent
 
 # ---- Runtime ---------------------------------------------------------------
 # Distroless: no shell, no package manager, minimal attack surface. The

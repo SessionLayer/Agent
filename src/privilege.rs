@@ -9,11 +9,21 @@
 //! The **guarantee** is provided structurally by the container `USER` directive
 //! (see `Dockerfile`) and the documented deployment precondition. The function
 //! below is a cheap secondary *detector*: if the Agent ever finds itself running
-//! as root it logs a loud warning. It intentionally does not hard-exit — the
+//! as root it logs a loud alarm at ERROR (so it survives the common
+//! `warn`-suppressing log filters). It intentionally does not hard-exit — the
 //! enforcement point is the immutable image/deployment, and a scaffold that
 //! refuses to start would be a poor place to make that policy call. Later
-//! sessions may promote this to fail-closed once the deployment contract is
-//! fully specified.
+//! sessions MUST promote this to fail-closed once the Agent gains host-key
+//! access / credential storage (S12), because from that point a root process can
+//! actually read the host key.
+//!
+//! **Scope of the check:** this probe detects only effective-UID 0. It does
+//! **not** attest capability posture — a non-root process granted
+//! `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH` (e.g. via a Kubernetes
+//! `securityContext.capabilities.add`) could still read the host key while
+//! `euid != 0`. Capability hygiene is enforced at the deployment layer
+//! (`runAsNonRoot`, drop all capabilities); a future fail-closed promotion may
+//! additionally inspect `/proc/self/status` `CapEff`.
 
 /// The effective UID of the current process, or `None` on non-Unix targets
 /// where the concept does not apply.
@@ -36,11 +46,14 @@ pub fn is_root() -> bool {
     matches!(effective_uid(), Some(0))
 }
 
-/// Emit a loud warning if the Agent is running as root. See the module docs for
+/// Emit a loud alarm if the Agent is running as root. See the module docs for
 /// why this is a violation of a hard deployment precondition (FR-CONN-6).
+///
+/// Logs at ERROR so the alarm is not swallowed by a `warn`-level log filter —
+/// the misconfiguration this guards against often coincides with terse logging.
 pub fn warn_if_root() {
     if is_root() {
-        tracing::warn!(
+        tracing::error!(
             requirement = "FR-CONN-6",
             "SessionLayer Agent is running as ROOT (euid=0). This violates a hard \
              deployment precondition: a root agent can read the node host key and \
