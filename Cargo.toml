@@ -39,7 +39,7 @@ tokio = { version = "1", default-features = false, features = ["rt-multi-thread"
 # Generated protobuf message types (from the vendored common.proto). The
 # `derive` feature provides the `::prost::Message` derive + `#[prost(..)]` helper
 # attributes the generated code relies on.
-prost = { version = "0.13", default-features = false, features = ["std", "derive"] }
+prost = { version = "0.14", default-features = false, features = ["std", "derive"] }
 
 # gRPC runtime, carried per the Session One baseline-deps directive so the
 # Rust codegen toolchain matches the Gateway/CP. TRADE-OFF (acknowledged, see
