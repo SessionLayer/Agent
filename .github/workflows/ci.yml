@@ -39,7 +39,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@aa7c1c80a07a27a84c0aa76d0cef0aad3830e330 # v2.7.8
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
 
       - name: Install cargo-nextest, cargo-deny, cargo-audit (pinned)
         uses: taiki-e/install-action@7ec692fc37da04f8da31c22ba9f3b71ef267e650 # v2.62.24
