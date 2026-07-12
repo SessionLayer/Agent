@@ -7,15 +7,13 @@
 //! "agent-process-compromise" to "node-root-compromise".
 //!
 //! The **guarantee** is provided structurally by the container `USER` directive
-//! (see `Dockerfile`) and the documented deployment precondition. The function
-//! below is a cheap secondary *detector*: if the Agent ever finds itself running
-//! as root it logs a loud alarm at ERROR (so it survives the common
-//! `warn`-suppressing log filters). It intentionally does not hard-exit — the
-//! enforcement point is the immutable image/deployment, and a scaffold that
-//! refuses to start would be a poor place to make that policy call. Later
-//! sessions MUST promote this to fail-closed once the Agent gains host-key
-//! access / credential storage (S12), because from that point a root process can
-//! actually read the host key.
+//! (see `Dockerfile`) and the documented deployment precondition. On top of that
+//! the Agent now performs a **fail-closed** runtime check at startup
+//! ([`require_non_root`]): from Session Twelve the Agent stores a renewable mTLS
+//! credential and is one hop from node-host-key access, so a root Agent is a live
+//! hazard, not a hypothetical — it refuses to start (resolving the Session-One
+//! carry-forward F-privilege-3, which asked to promote the earlier warn-only
+//! probe once credentials landed).
 //!
 //! **Scope of the check:** this probe detects only effective-UID 0. It does
 //! **not** attest capability posture — a non-root process granted
@@ -46,21 +44,33 @@ pub fn is_root() -> bool {
     matches!(effective_uid(), Some(0))
 }
 
-/// Emit a loud alarm if the Agent is running as root. See the module docs for
-/// why this is a violation of a hard deployment precondition (FR-CONN-6).
+/// Raised when the Agent is started as root — a hard, fail-closed refusal.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "SessionLayer Agent must not run as root (euid=0): a root agent can read the node host key and \
+     impersonate the node (FR-CONN-6 / Design §9.3). Run as a dedicated non-root user."
+)]
+pub struct RunningAsRoot;
+
+/// Fail closed if the Agent is running as root (effective UID 0).
 ///
-/// Logs at ERROR so the alarm is not swallowed by a `warn`-level log filter —
-/// the misconfiguration this guards against often coincides with terse logging.
-pub fn warn_if_root() {
+/// This is the runtime enforcement point (FR-CONN-6): from S12 the Agent holds a
+/// renewable credential and is adjacent to host-key access, so a root process is
+/// a real hazard. Returns `Err(RunningAsRoot)` on euid 0 so the caller aborts
+/// before any credential is loaded or issued; the loud ERROR log survives a
+/// `warn`-suppressing filter (the misconfiguration often coincides with terse
+/// logging).
+pub fn require_non_root() -> Result<(), RunningAsRoot> {
     if is_root() {
         tracing::error!(
             requirement = "FR-CONN-6",
-            "SessionLayer Agent is running as ROOT (euid=0). This violates a hard \
-             deployment precondition: a root agent can read the node host key and \
-             impersonate the node. Run as a dedicated non-root user (the container \
-             image already does)."
+            "SessionLayer Agent is running as ROOT (euid=0) — refusing to start. A root agent can \
+             read the node host key and impersonate the node. Run as a dedicated non-root user \
+             (the container image already does)."
         );
+        return Err(RunningAsRoot);
     }
+    Ok(())
 }
 
 #[cfg(test)]

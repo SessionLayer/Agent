@@ -1,16 +1,17 @@
 # SessionLayer Agent — the per-node outbound connector (Design §9.2, §9.3).
 #
-# Session One scope is scaffolding ONLY: package, contract codegen, a
-# `--version` surface, non-root posture, quality tooling and CI. No product
-# behaviour (no JoinMethod, no mTLS identity, no dial-back) lives here yet — see
-# CLAUDE.md "Scope".
+# Session Twelve gives the Agent a durable identity: it JOINS the platform
+# (TokenJoin / OidcJoin / MtlsJoin), receives a renewable internal mTLS X.509
+# identity carrying a generation counter, and keeps it fresh with a renew-ahead
+# loop — running non-root, one credential per node, lockable and clone-detecting
+# (FR-JOIN-1..6, FR-CONN-6). The identity machinery is a deliberate port of the
+# Session-Four Gateway machinery (Gateway/gateway-core/src/{identity,mtls}.rs).
+# The dial-back data path is Session Thirteen; no SSH/wire transport lives here.
 #
-# Layout decision: a SINGLE package that is both a library (`sessionlayer_agent`,
-# src/lib.rs) and a thin binary (`sessionlayer-agent`, src/main.rs). The library
-# split keeps the version/negotiation logic unit-testable from an integration
-# test without the build-time cost of a multi-crate workspace on a shared
-# 2-core builder. A workspace (`agent` + `agent-core`) is deferred until there
-# is enough logic to warrant it (S12/S13). Recorded in CLAUDE.md.
+# Layout: a SINGLE package that is both a library (`sessionlayer_agent`,
+# src/lib.rs) and a thin binary (`sessionlayer-agent`, src/main.rs) — the library
+# split keeps the identity/join logic unit- and integration-testable without a
+# multi-crate workspace on a shared 2-core builder.
 [package]
 name = "sessionlayer-agent"
 version = "0.1.0"
@@ -32,62 +33,89 @@ path = "src/main.rs"
 
 [dependencies]
 # Async runtime — plain multi-threaded tokio. The Agent is a control-plane
-# participant, NOT a hot byte-copy datapath, so tokio-uring is deliberately not
-# used (rationale in CLAUDE.md). Minimal feature set for the scaffold.
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros"] }
+# participant, NOT a hot byte-copy datapath (rationale in CLAUDE.md). `sync`/
+# `time` carry the renew-ahead loop's manual-trigger + shutdown channels.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
 
-# Generated protobuf message types (from the vendored common.proto). The
-# `derive` feature provides the `::prost::Message` derive + `#[prost(..)]` helper
-# attributes the generated code relies on.
-prost = { version = "0.13", default-features = false, features = ["std", "derive"] }
-
-# gRPC runtime, carried per the Session One baseline-deps directive so the
-# Rust codegen toolchain matches the Gateway/CP. TRADE-OFF (acknowledged, see
-# audit/F-supply-2): the Agent's live plane to the Gateway is the framed WIRE
-# protocol (contracts/wire/agent-gateway-v1.md), NOT gRPC, so tonic has no
-# runtime consumer this session yet still pulls ~10 transitive crates (http,
-# tower-*, base64, ...). default-features off drops the heavy transport/hyper
-# stack; the `grpc` re-export keeps the edge tracked by audit/deny. Revisit
-# slimming to build-only `tonic-build` in the session that wires CP-adjacent
-# codegen if the runtime consumer never materialises.
-tonic = { version = "0.13", default-features = false, features = ["codegen", "prost"] }
+# Generated protobuf message + gRPC client types (from the vendored contract:
+# common.proto + agent.proto). tonic 0.14 split the prost integration into
+# tonic-prost / tonic-prost-build. `tls-ring` builds the tokio-rustls transport
+# on the *ring* provider (no aws-lc-rs C/asm toolchain) — the CP<->Agent mTLS
+# plane. Aligned with the Gateway/CP toolchain.
+tonic = { version = "0.14", features = ["tls-ring"] }
+tonic-prost = "0.14"
+prost = "0.14"
 
 # TLS backend, pinned and installed process-wide at startup (single explicit
-# crypto provider fleet-wide before any TLS is negotiated in S13). ring backend
-# keeps the build lean vs aws-lc-rs. TLS 1.3-only by construction: both ends of
-# the Agent's plane are first-party SessionLayer software, so `tls12` is
-# deliberately NOT enabled — this removes all TLS 1.2 negotiation/downgrade
-# surface. Re-add only with a documented interop requirement.
+# crypto provider before any TLS is negotiated). ring backend; TLS 1.3-only by
+# construction (no `tls12`) — both ends of the Agent's plane are first-party.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 
-# Structured logging. Keep tracing-subscriber's default features (fmt, ansi,
-# registry, std, tracing-log) and add env-filter for RUST_LOG control.
+# X.509 identity: local ECDSA P-256 keypair + PKCS#10 CSR generation (the Agent
+# sends only a CSR; its mTLS private key never leaves — D2/§15). `ring` backend
+# (NOT aws_lc_rs); `pem` for the tonic client-identity PEM. Also the mock-CP
+# internal CA in tests.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+
+# Proof-of-possession signing for MtlsJoin: the operator pre-provisioned key
+# signs a binding over the enrollment CSR (ECDSA-P256/SHA-256, ASN.1 DER — what
+# the CP verifies with SHA256withECDSA). `pkcs8`/`pem` load the operator key.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem", "std"] }
+
+# OS RNG for the renew-ahead jitter sample (rand_core 0.6 — aligned with the
+# Gateway; the version rcgen/p256 speak).
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# PEM parse/encode (bootstrap CA anchors, DER<->PEM for the tonic Identity).
+pem = "3"
+
+# Single-writer data-dir lock (§8.2): an exclusive advisory lock so two Agent
+# processes can't race the credential / generation counter.
+fd-lock = "4"
+
+# Scrub secrets (mTLS private key, join token) from the heap on drop.
+zeroize = { version = "1", features = ["zeroize_derive"] }
+
+# Structured logging.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Machine-readable version descriptor (`--version-json`, deliverable §6.3.5).
+# Config manifest + machine-readable version descriptor.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Errors: thiserror for the library's typed error, anyhow for the binary.
+# Errors: thiserror for the library's typed errors, anyhow for the binary.
 thiserror = "2"
 anyhow = "1"
 
 # CLI.
 clap = { version = "4", features = ["derive"] }
 
-# Effective-UID probe for the non-root runtime warning (FR-CONN-6). libc is
-# already in the tree transitively via tokio; declaring it directly adds no new
-# distinct crate to the supply chain.
+# Effective-UID probe for the non-root fail-closed check (FR-CONN-6). libc is
+# already in the tree transitively via tokio.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [build-dependencies]
-# Contract codegen: prost/tonic message types from the vendored common.proto.
-tonic-build = { version = "0.13", default-features = false, features = ["prost"] }
+# Contract codegen: prost/tonic types from the vendored protos. The AgentIdentity
+# service emits a client (the Agent's enroll/renew calls) and a server (the
+# in-process mock CP in tests).
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "time", "sync", "test-util", "net"] }
+# In-process mock CP (a real TLS 1.3 tonic server) + non-root container E2E.
+tokio-stream = { version = "0.1", features = ["net"] }
+tempfile = "3"
+testcontainers = "0.27"
+# The mock CP signs the Agent's CSRs → needs rcgen CSR parsing (`x509-parser`).
+# Kept in dev-deps only: Cargo feature-unification adds it to test builds while
+# the production build (no dev-deps) stays lean (no x509-parser edge). Mirrors
+# the Gateway.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }
 
 [profile.release]
-# Reproducible-build / provenance intent (NFR-7): deterministic, deb"info"-free
+# Reproducible-build / provenance intent (NFR-7): deterministic, debuginfo-free
 # release artifacts. LTO + single codegen unit for a small, self-contained agent.
 lto = true
 codegen-units = 1

@@ -9,21 +9,23 @@ the canonical cross-repo contracts live in `ControlPlane-API/contracts/`.
 
 ---
 
-## Scope is per session — Session One is scaffolding ONLY
+## Scope is per session
 
-This repo currently contains **no product behaviour**. Session One delivered the
-package, contract codegen, the `--version` surface, the non-root posture, and
-the quality/CI gate — nothing more. The following are **deliberately absent** and
-arrive in later sessions behind the frozen contracts:
+Session One was scaffolding only. **Session Twelve added the Agent's durable
+identity** (Design §8, FR-JOIN-*): the `JoinMethod` trait + three methods
+([`join`]), the renewable mTLS X.509 identity + generation counter + renew-ahead
+([`identity`]), a fail-closed non-root check, and the CP-facing mTLS channel
+([`mtls`]). The identity machinery is a deliberate port of the Session-Four
+Gateway machinery — do NOT reinvent it; reuse `Gateway/gateway-core/src/{identity,mtls,tls,secret}.rs`.
 
-- `JoinMethod` (token / OIDC / mTLS bootstrap), the durable mTLS X.509 identity,
-  the generation counter, renew-ahead (FR-JOIN-*) — **S12**.
+Still **deliberately absent** (later sessions, behind the frozen contracts):
+
 - The wire transport (WebSocket/TLS), framing, HELLO/version negotiation,
   dial-back, stream splice (`contracts/wire/agent-gateway-v1.md`) — **S13**.
-- `NodeConnector`, node status/heartbeat, ≥2 control channels (FR-HA-6) — S12/S13.
+- `NodeConnector`, node status/heartbeat, ≥2 control channels (FR-HA-6) — S13/S14.
 
-**If you find yourself implementing an `FR-*` behaviour, you are out of scope for
-a scaffolding change.** Add the behaviour in its designated session.
+**If you find yourself implementing an out-of-session `FR-*` behaviour, stop.**
+Add it in its designated session.
 
 ---
 
@@ -42,10 +44,11 @@ How it is enforced, in layers:
    job) fails the build if the final runtime `USER` is ever root/empty.
    `scripts/verify-nonroot-image.sh` does the full build-and-`docker inspect`
    check (needs Docker + network).
-3. **Runtime detector:** `privilege::warn_if_root()` logs a loud warning if the
-   process ever finds `euid == 0`. It warns rather than hard-exits — the
-   enforcement point is the immutable image/deployment, and later sessions may
-   promote this to fail-closed once the deployment contract is fully specified.
+3. **Runtime, fail-closed (S12):** `privilege::require_non_root()` **refuses to
+   start** if `euid == 0`, called BEFORE any credential is loaded/issued. From
+   S12 the Agent holds a renewable credential and is one hop from host-key
+   access, so a root process is a live hazard — the earlier warn-only probe was
+   promoted to a hard refusal (closing the S1 carry-forward F-privilege-3).
 
 ---
 
@@ -82,13 +85,15 @@ The Agent is **contract-first** (Design §13, FR-API-1). It does not hand-write
 the shared message types; it generates them from a **byte-identical vendored
 copy** of the canonical proto:
 
-- Source of truth: `ControlPlane-API/contracts/proto/sessionlayer/controlplane/v1/common.proto`.
-- Vendored copy (committed): `proto/sessionlayer/controlplane/v1/common.proto`.
-- `build.rs` runs `tonic-build`/`prost-build` over the vendored copy. `common.proto`
-  declares **no service**, so only the message types (`ProtocolVersion`,
-  `ComponentInfo`) are generated — no gRPC stub. The Agent's live plane to the
-  Gateway is the **framed wire protocol** (`contracts/wire/agent-gateway-v1.md`),
-  not gRPC.
+- Source of truth: `ControlPlane-API/contracts/proto/sessionlayer/controlplane/v1/{common,agent}.proto`.
+- Vendored copies (committed): `proto/sessionlayer/controlplane/v1/{common,agent}.proto`.
+- `build.rs` runs `tonic-prost-build` over the vendored copies. `common.proto`
+  has the shared messages; `agent.proto` (S12) declares the **`AgentIdentity`**
+  service (`EnrollAgent`, `RenewAgentIdentity`) — build.rs emits the **client**
+  (the Agent's enroll/renew calls, [`identity`]) and the **server** (used only by
+  the in-process mock CP in tests). The CP↔Agent **identity** plane is gRPC/mTLS;
+  the future dial-back **data** plane is the framed wire protocol
+  (`contracts/wire/agent-gateway-v1.md`, S13).
 
 Why vendor rather than reference across repos: the parent `SessionLayer/` folder
 is intentionally **not** a git repo, and CI checks out this repo alone.
@@ -123,18 +128,28 @@ justify it (S12/S13).
 
 ## Dependencies (why each is here; NFR-7 keeps this list honest)
 
-`tokio` (runtime), `prost` (generated types), `tracing`(+`-subscriber`)
-(logging), `serde`/`serde_json` (`--version-json`), `thiserror`/`anyhow`
-(errors), `clap` (CLI), `rustls`+`ring` (pinned TLS backend, installed at
-startup), `libc` (euid probe; already transitive via tokio). `tonic` is the
-pinned Rust gRPC runtime, **re-exported from `grpc`** so it is a tracked
-dependency rather than dead weight; it is carried for toolchain symmetry with
-the Gateway/CP and for the CP-adjacent codegen wired in a later session (the
-Agent's own plane is the wire protocol, not gRPC). `tonic-build` is a build-only
-codegen tool. Adding a runtime dependency is a supply-chain decision — justify it
-here and keep the set minimal.
+`tokio` (runtime), `tonic`+`tonic-prost`+`prost` (the CP↔Agent gRPC/mTLS
+identity plane — a real runtime consumer since S12), `rustls`+`ring` (pinned TLS
+backend, installed at startup; TLS 1.3-only), `rcgen` (local keypair + PKCS#10
+CSR generation — key custody, D2/§15), `p256` (MtlsJoin proof-of-possession
+ECDSA signing), `rand_core` (renew-ahead jitter), `pem` (DER↔PEM anchors),
+`fd-lock` (single-writer data-dir lock, §8.2), `zeroize` (scrub key/token),
+`serde`/`serde_json` (persisted manifest + `--version-json`),
+`thiserror`/`anyhow` (errors), `clap` (CLI), `libc` (euid probe). Build-only:
+`tonic-prost-build`. Dev-only: `rcgen` gains `x509-parser` via feature-unification
+(the mock CP signs CSRs) so production stays lean. Adding a runtime dependency is
+a supply-chain decision — justify it here and keep the set minimal (NFR-7).
 
 ---
+
+## Comment discipline (S5-onward baseline)
+
+Comment **sparingly — WHY, not WHAT.** No section-divider banners, no comments
+that restate code or a name, no obvious narration. Prefer self-documenting names
+and small functions. Keep terse doc-comments only on genuinely public API /
+contract surfaces and a brief note for a security/crypto/spec-tied invariant
+(e.g. "fail closed", a WHY tied to an FR/Design §). Match the leaner post-S5
+baseline shared across the repos; do not restore a denser style.
 
 ## Gate & audit
 

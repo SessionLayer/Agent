@@ -1,28 +1,33 @@
 //! Build script: generate Rust types from the vendored contract.
 //!
 //! The Agent is **contract-first** (Design §13, FR-API-1): it does not
-//! hand-write the shared message types, it generates them from a byte-identical
-//! vendored copy of the canonical `common.proto` (see `scripts/sync-contracts.sh`
-//! and CLAUDE.md "Contract vendoring"). `common.proto` declares no service, so
-//! only the prost message types (`ProtocolVersion`, `ComponentInfo`) are
-//! emitted — no gRPC client/server stub. The Agent's live plane to the Gateway
-//! is the framed wire protocol (`contracts/wire/agent-gateway-v1.md`), not gRPC.
+//! hand-write the shared message types or gRPC stubs, it generates them from a
+//! byte-identical vendored copy of the canonical protos (see
+//! `scripts/sync-contracts.sh` and CLAUDE.md "Contract vendoring").
+//!
+//! - `common.proto` — the shared messages (`ProtocolVersion`, `ComponentInfo`);
+//!   no service.
+//! - `agent.proto` (S12) — the `AgentIdentity` service (`EnrollAgent`,
+//!   `RenewAgentIdentity`). We emit the **client** (the Agent's own enroll/renew
+//!   calls) and the **server** (used only by the in-process mock CP in tests) so
+//!   the whole plane is exercised end-to-end from generated code.
 
 use std::path::Path;
 
 fn main() {
     let proto_root = Path::new("proto");
-    let common = proto_root.join("sessionlayer/controlplane/v1/common.proto");
+    let v1 = "sessionlayer/controlplane/v1";
+    let common = proto_root.join(v1).join("common.proto");
+    let agent = proto_root.join(v1).join("agent.proto");
 
-    // Rebuild only when the contract (or this script) changes.
+    // Rebuild only when a contract file (or this script) changes.
     println!("cargo:rerun-if-changed={}", common.display());
+    println!("cargo:rerun-if-changed={}", agent.display());
     println!("cargo:rerun-if-changed=build.rs");
 
-    tonic_build::configure()
-        // No service in common.proto → no client/server codegen.
-        .build_client(false)
-        .build_server(false)
-        // Emit the generated module into OUT_DIR; included via src/proto.rs.
-        .compile_protos(&[common], &[proto_root])
-        .expect("failed to generate Rust types from the vendored common.proto");
+    tonic_prost_build::configure()
+        .build_client(true)
+        .build_server(true)
+        .compile_protos(&[common, agent], &[proto_root.to_path_buf()])
+        .expect("failed to generate Rust types from the vendored protos");
 }
