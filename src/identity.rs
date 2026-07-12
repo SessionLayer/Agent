@@ -841,14 +841,35 @@ mod tests {
 
     #[test]
     fn rpc_error_does_not_leak_cp_message() {
-        // A hostile CP status message with ANSI + newline must not reach a log via
-        // the error's Display; only the gRPC code is rendered.
+        // A hostile CP status message with ANSI + newline must not reach a log or
+        // startup-stderr sink — neither via the error's own Display, nor via the
+        // source chain that `#[from] tonic::Status` establishes when the error is
+        // wrapped for propagation to `fn main`'s Termination Debug-print.
         let hostile = "evil\n\u{1b}[2Jline";
         let err = IdentityError::Rpc(tonic::Status::permission_denied(hostile));
+
+        // (a) The error's own Display renders only the gRPC code.
         let disp = format!("{err}");
         assert!(!disp.contains("evil"), "Display leaked CP message: {disp}");
         assert!(!disp.contains('\u{1b}'));
         assert!(disp.contains("PermissionDenied"));
+
+        // (b) The `main.rs` enroll/renew boundary wrap MUST flatten to the
+        // code-only Display (`anyhow!("… {e}")`) and carry NO `tonic::Status`
+        // source. Using `.context(_)` instead would keep the Status as `source()`,
+        // and the source-chain-walking Debug print would emit the CP message.
+        let wrapped = anyhow::anyhow!("agent enrollment failed: {err}");
+        let dbg = format!("{wrapped:?}");
+        assert!(
+            !dbg.contains("evil"),
+            "anyhow Debug leaked the CP message via the source chain: {dbg}"
+        );
+        assert!(!dbg.contains('\u{1b}'));
+        assert_eq!(
+            wrapped.chain().count(),
+            1,
+            "wrap must carry no error source"
+        );
     }
 
     #[test]

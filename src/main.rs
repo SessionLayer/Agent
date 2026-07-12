@@ -207,9 +207,14 @@ async fn run(config: AgentConfig, once: bool) -> anyhow::Result<()> {
                 "no persisted identity — joining the platform"
             );
             let anchors = config.bootstrap_anchors_der().context("bootstrap CA")?;
+            // Flatten the IdentityError to its code-only Display and drop the
+            // `#[from] tonic::Status` source: `.context()` would keep the Status as
+            // the error `source()`, and `fn main`'s Termination Debug-print of a
+            // returned `Err` walks the chain and emits the CP-controlled Status
+            // message (untrusted wire text) to startup stderr (§8.4 / NFR-2).
             identity::enroll(&store, &params, &anchors, join.as_ref(), &config.node_name)
                 .await
-                .context("agent enrollment")?
+                .map_err(|e| anyhow::anyhow!("agent enrollment failed: {e}"))?
         }
     };
 
@@ -260,7 +265,9 @@ async fn maybe_startup_renew(
             tracing::warn!(error = %e, "startup renew failed transiently — keeping current, loop will retry");
             Ok(existing)
         }
-        Err(e) => Err(e).context("startup renewal"),
+        // Flatten to the code-only Display; do NOT carry the `tonic::Status`
+        // source into the anyhow chain (else Termination leaks the CP message).
+        Err(e) => Err(anyhow::anyhow!("startup renewal failed: {e}")),
     }
 }
 

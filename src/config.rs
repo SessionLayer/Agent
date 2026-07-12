@@ -92,10 +92,15 @@ impl JoinConfig {
                     path: certificate_file.clone(),
                     source,
                 })?;
-                let key = std::fs::read_to_string(key_file).map_err(|source| ConfigError::Io {
-                    path: key_file.clone(),
-                    source,
-                })?;
+                // The operator PKI private key is a long-lived, high-value secret:
+                // hold it in a scrub-on-drop buffer like every other secret here,
+                // so it is not left in a freed-but-unscrubbed heap allocation.
+                let key = Zeroizing::new(std::fs::read_to_string(key_file).map_err(|source| {
+                    ConfigError::Io {
+                        path: key_file.clone(),
+                        source,
+                    }
+                })?);
                 let jm = MtlsJoin::from_pem(&cert, &key).map_err(|e| ConfigError::Invalid {
                     field: "mtls join material".to_string(),
                     reason: e.to_string(),
