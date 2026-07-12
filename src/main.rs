@@ -12,6 +12,7 @@
 //! The dial-back data path arrives in Session Thirteen.
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
@@ -25,7 +26,6 @@ use sessionlayer_agent::config::{
 use sessionlayer_agent::identity::{self, IdentityStore, RenewAhead, RenewAheadConfig};
 use sessionlayer_agent::mtls::ChannelParams;
 use sessionlayer_agent::{init_process, privilege, telemetry, version, LONG_VERSION};
-use tonic::Code;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -145,7 +145,7 @@ impl RunArgs {
 }
 
 #[tokio::main(flavor = "multi_thread")]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
 
     // `--version-json` is a pure query: no logging side effects, no init.
@@ -153,7 +153,7 @@ async fn main() -> anyhow::Result<()> {
         let json = serde_json::to_string_pretty(&version::version_info())
             .context("serialising version descriptor")?;
         println!("{json}");
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
 
     telemetry::init(cli.log.as_deref());
@@ -178,14 +178,33 @@ async fn main() -> anyhow::Result<()> {
                 semver = %info.semver,
                 "SessionLayer Agent ready. Use the `run` subcommand to join and maintain identity."
             );
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
     }
 }
 
+/// The numeric exit status for a renew-ahead stop reason. A clean shutdown is 0;
+/// a terminal/security stop is a DISTINCT non-zero code so an orchestrator alerts
+/// (and does not silently restart into a crash-loop) rather than treating it as
+/// success — the process exit status is S12's only health signal (FR-JOIN-5). See
+/// `RUNBOOK.md` for the response per code.
+fn exit_status(outcome: &identity::RenewOutcome) -> u8 {
+    match outcome {
+        identity::RenewOutcome::Shutdown => 0,
+        identity::RenewOutcome::GenerationMismatch { .. } => 3,
+        identity::RenewOutcome::RepairNeeded => 4,
+    }
+}
+
+fn exit_code(outcome: identity::RenewOutcome) -> ExitCode {
+    ExitCode::from(exit_status(&outcome))
+}
+
 /// Open the data-dir (single-writer lock), load-or-enroll the identity, then run
-/// the renew-ahead loop until shutdown (unless `once`).
-async fn run(config: AgentConfig, once: bool) -> anyhow::Result<()> {
+/// the renew-ahead loop until shutdown (unless `once`). Returns the process exit
+/// code: `SUCCESS` on clean shutdown / `--once`, a distinct non-zero code on a
+/// terminal/security loop stop (see [`exit_code`]).
+async fn run(config: AgentConfig, once: bool) -> anyhow::Result<ExitCode> {
     let store = IdentityStore::open(&config.data_dir)
         .with_context(|| format!("opening credential data-dir {:?}", config.data_dir))?;
     let params = config.channel_params();
@@ -226,7 +245,7 @@ async fn run(config: AgentConfig, once: bool) -> anyhow::Result<()> {
     );
 
     if once {
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
 
     let renew = RenewAhead::new(
@@ -239,8 +258,8 @@ async fn run(config: AgentConfig, once: bool) -> anyhow::Result<()> {
         },
         cred,
     );
-    renew.run(Box::pin(shutdown_signal())).await;
-    Ok(())
+    let outcome = renew.run(Box::pin(shutdown_signal())).await;
+    Ok(exit_code(outcome))
 }
 
 /// If the loaded credential is at/below the configured remaining-TTL fraction,
@@ -261,27 +280,17 @@ async fn maybe_startup_renew(
     tracing::info!(remaining, "identity near expiry at startup — renewing now");
     match identity::renew(store, params, &existing).await {
         Ok(renewed) => Ok(renewed),
-        Err(e) if is_transient(&e) => {
+        // Classify identically to the loop (single source of truth): a transient
+        // failure keeps the current still-valid credential and lets the loop retry.
+        Err(e) if identity::classify_renew_error(&e) == identity::RenewalDisposition::Transient => {
             tracing::warn!(error = %e, "startup renew failed transiently — keeping current, loop will retry");
             Ok(existing)
         }
-        // Flatten to the code-only Display; do NOT carry the `tonic::Status`
-        // source into the anyhow chain (else Termination leaks the CP message).
+        // RepairNeeded / Mismatch: fail closed. Flatten to the code-only Display;
+        // do NOT carry the `tonic::Status` source into the anyhow chain
+        // (F-identity-1 — else `fn main`'s Termination print leaks the CP message).
         Err(e) => Err(anyhow::anyhow!("startup renewal failed: {e}")),
     }
-}
-
-/// A transient renewal error (worth keeping the current credential + retrying)
-/// vs. a terminal one (locked / clone-detected / unknown cert) that fails closed.
-fn is_transient(err: &identity::IdentityError) -> bool {
-    matches!(
-        err,
-        identity::IdentityError::Rpc(status)
-            if !matches!(
-                status.code(),
-                Code::FailedPrecondition | Code::Unauthenticated | Code::PermissionDenied
-            )
-    ) || matches!(err, identity::IdentityError::Mtls(_))
 }
 
 /// Resolve on SIGTERM (orchestrator stop) or SIGINT (Ctrl-C).
@@ -304,5 +313,26 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_and_security_stops_are_distinct_non_zero_exit_codes() {
+        // FR-JOIN-5 / F1: a clone-detection or repair-needed stop must NOT look
+        // like a clean shutdown (exit 0), or an orchestrator silently restarts
+        // into a crash-loop with no operator signal.
+        assert_eq!(exit_status(&identity::RenewOutcome::Shutdown), 0);
+        assert_eq!(
+            exit_status(&identity::RenewOutcome::GenerationMismatch {
+                expected: 3,
+                got: 7
+            }),
+            3
+        );
+        assert_eq!(exit_status(&identity::RenewOutcome::RepairNeeded), 4);
     }
 }

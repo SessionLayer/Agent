@@ -233,6 +233,10 @@ pub fn generate_keypair_and_csr(node_name: &str) -> Result<KeypairCsr, IdentityE
 /// tiny allocation per process, released when the process exits). This guarantees
 /// a second Agent process cannot open the same data-dir and race the generation
 /// counter.
+///
+/// The lock is `flock`-based, which is per-open-file-description and works within
+/// a single host; it is a no-op / unreliable on some network filesystems, so the
+/// data-dir MUST be node-local (see `RUNBOOK.md`).
 pub struct IdentityStore {
     data_dir: PathBuf,
     _lock: fd_lock::RwLockWriteGuard<'static, std::fs::File>,
@@ -413,6 +417,15 @@ pub async fn enroll(
 /// credential, verify the returned generation is exactly `current + 1` (else a
 /// [`IdentityError::GenerationMismatch`] security event), and persist-before-adopt
 /// the rotated identity.
+///
+/// **Residual self-lock window (accepted).** persist-before-adopt makes the
+/// Agent-local crash between persist and adopt safe, but it cannot close the
+/// window between the CP *committing* generation `N+1` and this Agent *persisting*
+/// it: a crash in that gap leaves the Agent at `N` while the CP is at `N+1`. The
+/// next renewal then declares `N`, the CP sees a mismatch and auto-locks
+/// (`RepairNeeded`) — fail closed to operator re-provision (FR-JOIN-2 makes that
+/// automatable), never silent corruption. The window is the response/persist gap
+/// only; see `RUNBOOK.md`.
 pub async fn renew(
     store: &IdentityStore,
     params: &ChannelParams,
@@ -570,6 +583,80 @@ fn validated_window(nb: i64, na: i64) -> Result<(SystemTime, SystemTime), Identi
 
 // ---- renew-ahead loop ---------------------------------------------------------
 
+/// Minimum spacing between two *consecutive* successful renewals (F2). After a
+/// renewal the loop re-derives the schedule from the new certificate; if that cert
+/// is already past its renew trigger — a short TTL with a large clock-skew backdate
+/// (FR-BOOT-4), or a CP clock ahead of the node — the naive schedule is zero and
+/// the loop would renew back-to-back, hammering the CP and burning generations.
+/// Flooring the *post-renewal* wait bounds that to ≈1 renewal/min.
+const RENEW_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Why the renew-ahead loop stopped, so the caller can choose a distinct process
+/// exit status. A terminal/security stop MUST NOT look like a clean shutdown
+/// (FR-JOIN-5): otherwise an orchestrator sees exit 0 and silently restarts into a
+/// slow crash-loop with no operator signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenewOutcome {
+    /// A shutdown signal ended the loop — a clean exit.
+    Shutdown,
+    /// Generation mismatch (§8.2 clone detection): the CP auto-locked the identity
+    /// (no auto-clear). Operator re-provision required.
+    GenerationMismatch { expected: u64, got: u64 },
+    /// A repair-needed rejection (locked identity / unknown-rotated cert / stale
+    /// generation the CP advanced past): re-provision required (§8.1).
+    RepairNeeded,
+}
+
+/// How the renew-ahead loop and the startup check treat a renewal error, so both
+/// classify identically (one source of truth — replaces the former divergent
+/// `is_repair_needed` / `is_transient` pair).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenewalDisposition {
+    /// A transient blip (CP briefly down, network/TLS, an I/O hiccup, or a
+    /// malformed CP validity window): keep the current valid credential and retry.
+    Transient,
+    /// The CP will keep rejecting this credential (locked / unknown cert / stale
+    /// generation): stop and require operator re-provision (§8.1).
+    RepairNeeded,
+    /// A generation-counter fork (§8.2 clone detection): stop; a security event.
+    Mismatch,
+}
+
+/// Classify a renewal error identically for the startup check and the loop. Only
+/// the terminal gRPC rejections (`FailedPrecondition`/`Unauthenticated`/
+/// `PermissionDenied` — locked / unknown-cert / stale-generation) and a
+/// `GenerationMismatch` stop the loop; everything else (transport, I/O, a corrupt
+/// CP window) keeps the current valid credential and retries (fail closed — a new
+/// credential is never adopted on error).
+pub fn classify_renew_error(err: &IdentityError) -> RenewalDisposition {
+    match err {
+        IdentityError::GenerationMismatch { .. } => RenewalDisposition::Mismatch,
+        IdentityError::Rpc(status)
+            if matches!(
+                status.code(),
+                tonic::Code::FailedPrecondition
+                    | tonic::Code::Unauthenticated
+                    | tonic::Code::PermissionDenied
+            ) =>
+        {
+            RenewalDisposition::RepairNeeded
+        }
+        _ => RenewalDisposition::Transient,
+    }
+}
+
+/// Apply the post-renewal minimum-interval floor (F2), never delaying past expiry
+/// (cap the floor at half the remaining TTL). Pure, for unit testing.
+fn floor_after_renew(base: Duration, remaining: Duration) -> Duration {
+    base.max(RENEW_MIN_INTERVAL.min(remaining / 2))
+}
+
+/// Apply ±50% jitter to the retry backoff so a fleet that entered backoff together
+/// (e.g. a CP outage) does not retry in lockstep (F5). `sample` is in `[-1, 1]`.
+fn jittered_backoff(base: Duration, sample: f64) -> Duration {
+    base.mul_f64(1.0 + 0.5 * sample.clamp(-1.0, 1.0))
+}
+
 /// A handle to trigger a renewal on demand and to observe the current credential.
 pub struct RenewHandle {
     trigger_tx: tokio::sync::mpsc::Sender<()>,
@@ -640,14 +727,20 @@ impl RenewAhead {
         }
     }
 
-    /// Run the loop until `shutdown` resolves. Each iteration waits until the
-    /// jittered renew-ahead instant (or a manual trigger, or shutdown), then
-    /// renews with persist-before-adopt and publishes the new credential. A
-    /// generation-mismatch security event (clone detection) stops the loop.
-    pub async fn run(mut self, mut shutdown: impl std::future::Future<Output = ()> + Unpin) {
+    /// Run the loop until `shutdown` resolves, returning why it stopped so the
+    /// caller can pick a distinct exit status ([`RenewOutcome`]). Each iteration
+    /// waits until the jittered renew-ahead instant (or a manual trigger, or
+    /// shutdown), then renews with persist-before-adopt and publishes the new
+    /// credential. A generation-mismatch (clone detection) or a repair-needed
+    /// rejection stops the loop and fails closed (the old credential is kept).
+    pub async fn run(
+        mut self,
+        mut shutdown: impl std::future::Future<Output = ()> + Unpin,
+    ) -> RenewOutcome {
+        let mut just_renewed = false;
         loop {
             let current = self.current_rx.borrow().clone();
-            let delay = compute_renew_delay(
+            let base = compute_renew_delay(
                 SystemTime::now(),
                 current.not_before,
                 current.not_after,
@@ -655,12 +748,24 @@ impl RenewAhead {
                 self.config.renew_jitter_fraction,
                 random_jitter_sample(),
             );
+            // F2: after a renewal, floor the wait so a cert born past its trigger
+            // can't storm the CP, but never delay past expiry.
+            let delay = if just_renewed {
+                let remaining = current
+                    .not_after
+                    .duration_since(SystemTime::now())
+                    .unwrap_or(Duration::ZERO);
+                floor_after_renew(base, remaining)
+            } else {
+                base
+            };
+            just_renewed = false;
 
             tokio::select! {
                 biased;
                 _ = &mut shutdown => {
                     tracing::info!("renew-ahead loop shutting down");
-                    return;
+                    return RenewOutcome::Shutdown;
                 }
                 _ = self.trigger_rx.recv() => {
                     tracing::info!("renew-ahead: manual trigger");
@@ -678,6 +783,7 @@ impl RenewAhead {
                         "renewed mTLS identity (persist-before-adopt)"
                     );
                     let _ = self.current_tx.send(std::sync::Arc::new(new_cred));
+                    just_renewed = true;
                 }
                 Err(IdentityError::GenerationMismatch { expected, got }) => {
                     // Security event (§8.2): the CP auto-locks the identity on a
@@ -688,48 +794,34 @@ impl RenewAhead {
                         got,
                         "SECURITY: generation mismatch on renewal — the identity is auto-locked by the Control Plane (possible clone); stopping renew-ahead, operator re-provision required (§8.2)"
                     );
-                    return;
+                    return RenewOutcome::GenerationMismatch { expected, got };
                 }
-                Err(e) if is_repair_needed(&e) => {
-                    // A rejection the CP will keep returning: locked identity,
-                    // unknown/rotated client cert, or a stale generation the CP
-                    // has already advanced past. Stop + flag for re-enrollment
-                    // (§8.1). Fail-closed: the old credential is kept.
-                    tracing::error!(
-                        error = %e,
-                        "REPAIR-NEEDED: renewal rejected by the Control Plane (locked / unknown cert / stale generation) — stopping renew-ahead; re-provision required (§8.1)"
-                    );
-                    return;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "renew-ahead: renewal failed transiently, will retry");
-                    tokio::select! {
-                        biased;
-                        _ = &mut shutdown => return,
-                        _ = tokio::time::sleep(self.config.retry_backoff) => {}
+                Err(e) => match classify_renew_error(&e) {
+                    RenewalDisposition::Transient => {
+                        tracing::warn!(error = %e, "renew-ahead: renewal failed transiently, will retry");
+                        tokio::select! {
+                            biased;
+                            _ = &mut shutdown => return RenewOutcome::Shutdown,
+                            _ = tokio::time::sleep(jittered_backoff(
+                                self.config.retry_backoff,
+                                random_jitter_sample(),
+                            )) => {}
+                        }
                     }
-                }
+                    // RepairNeeded, or a Mismatch not destructured above: stop and
+                    // require re-provision (fail closed — the old credential is
+                    // kept). §8.1.
+                    _ => {
+                        tracing::error!(
+                            error = %e,
+                            "REPAIR-NEEDED: renewal rejected by the Control Plane (locked / unknown cert / stale generation) — stopping renew-ahead; re-provision required (§8.1)"
+                        );
+                        return RenewOutcome::RepairNeeded;
+                    }
+                },
             }
         }
     }
-}
-
-/// Whether a renewal error is a **repair-needed** rejection (the CP will keep
-/// returning it) rather than a transient blip. Locked identity, unknown/rotated
-/// client certificate, and a stale generation the CP has already advanced past
-/// all map to gRPC codes that mean "this credential can't renew itself" → stop
-/// and require re-provision (§8.1). `GenerationMismatch` is handled separately.
-fn is_repair_needed(err: &IdentityError) -> bool {
-    matches!(
-        err,
-        IdentityError::Rpc(status)
-            if matches!(
-                status.code(),
-                tonic::Code::FailedPrecondition
-                    | tonic::Code::Unauthenticated
-                    | tonic::Code::PermissionDenied
-            )
-    )
 }
 
 #[cfg(test)]
@@ -873,22 +965,97 @@ mod tests {
     }
 
     #[test]
-    fn repair_needed_classifies_terminal_rejections() {
-        assert!(is_repair_needed(&IdentityError::Rpc(
-            tonic::Status::permission_denied("locked")
-        )));
-        assert!(is_repair_needed(&IdentityError::Rpc(
-            tonic::Status::unauthenticated("unknown cert")
-        )));
-        assert!(is_repair_needed(&IdentityError::Rpc(
-            tonic::Status::failed_precondition("stale generation")
-        )));
-        assert!(!is_repair_needed(&IdentityError::Rpc(
-            tonic::Status::unavailable("cp restarting")
-        )));
-        assert!(!is_repair_needed(&IdentityError::Io(
-            std::io::Error::other("x")
-        )));
+    fn classify_renew_error_unifies_startup_and_loop_dispositions() {
+        use RenewalDisposition::*;
+        // Terminal gRPC rejections → RepairNeeded (stop, re-provision).
+        assert_eq!(
+            classify_renew_error(&IdentityError::Rpc(tonic::Status::permission_denied(
+                "locked"
+            ))),
+            RepairNeeded
+        );
+        assert_eq!(
+            classify_renew_error(&IdentityError::Rpc(tonic::Status::unauthenticated(
+                "unknown"
+            ))),
+            RepairNeeded
+        );
+        assert_eq!(
+            classify_renew_error(&IdentityError::Rpc(tonic::Status::failed_precondition(
+                "stale"
+            ))),
+            RepairNeeded
+        );
+        // Clone detection → Mismatch.
+        assert_eq!(
+            classify_renew_error(&IdentityError::GenerationMismatch {
+                expected: 2,
+                got: 5
+            }),
+            Mismatch
+        );
+        // Everything else keeps the current credential and retries. Corrupt/Io now
+        // agree between startup and loop (previously startup exited on these).
+        assert_eq!(
+            classify_renew_error(&IdentityError::Rpc(tonic::Status::unavailable(
+                "cp restarting"
+            ))),
+            Transient
+        );
+        assert_eq!(
+            classify_renew_error(&IdentityError::Io(std::io::Error::other("x"))),
+            Transient
+        );
+        assert_eq!(
+            classify_renew_error(&IdentityError::Corrupt("bad window".to_string())),
+            Transient
+        );
+    }
+
+    #[test]
+    fn remaining_fraction_tracks_the_window() {
+        let not_before = UNIX_EPOCH + Duration::from_secs(1_000);
+        let not_after = not_before + Duration::from_secs(300);
+        assert!((remaining_fraction(not_before, not_before, not_after) - 1.0).abs() < 1e-6);
+        let mid = not_before + Duration::from_secs(150);
+        assert!((remaining_fraction(mid, not_before, not_after) - 0.5).abs() < 1e-6);
+        assert_eq!(remaining_fraction(not_after, not_before, not_after), 0.0);
+        // A now past not_after clamps to 0, never negative.
+        assert_eq!(
+            remaining_fraction(not_after + Duration::from_secs(10), not_before, not_after),
+            0.0
+        );
+    }
+
+    #[test]
+    fn floor_after_renew_bounds_a_storm_but_never_delays_past_expiry() {
+        // A cert born past its trigger (base 0) with plenty of TTL left is floored
+        // to the full minimum interval — no back-to-back renew storm.
+        assert_eq!(
+            floor_after_renew(Duration::ZERO, Duration::from_secs(3600)),
+            RENEW_MIN_INTERVAL
+        );
+        // Near expiry, the floor is capped at half the remaining TTL so we never
+        // schedule the next renew past not_after.
+        assert_eq!(
+            floor_after_renew(Duration::ZERO, Duration::from_secs(20)),
+            Duration::from_secs(10)
+        );
+        // A base already beyond the floor is left untouched.
+        assert_eq!(
+            floor_after_renew(Duration::from_secs(200), Duration::from_secs(3600)),
+            Duration::from_secs(200)
+        );
+    }
+
+    #[test]
+    fn jittered_backoff_stays_within_half_bounds() {
+        let base = Duration::from_secs(30);
+        assert_eq!(jittered_backoff(base, 0.0), base);
+        assert_eq!(jittered_backoff(base, -1.0), Duration::from_secs(15));
+        assert_eq!(jittered_backoff(base, 1.0), Duration::from_secs(45));
+        // Out-of-range samples are clamped, never producing a zero/huge backoff.
+        assert_eq!(jittered_backoff(base, 9.0), Duration::from_secs(45));
     }
 
     #[test]
