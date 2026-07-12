@@ -1,7 +1,14 @@
 # F-supply-2: tonic carries ~10 unused transitive crates this session
 - Severity: low
-- Status: Accepted-Risk
+- Status: Verified-Fixed
 - Area: supply-chain
+
+## Resolution (Session Twelve)
+`tonic` now has a real runtime consumer: the CP↔Agent `AgentIdentity` gRPC/mTLS
+plane (`EnrollAgent`/`RenewAgentIdentity`, `src/{identity,mtls}.rs`). The
+follow-up's premise ("no runtime gRPC consumer → slim to build-only") is moot —
+the transitive graph is now load-bearing, not dead weight. The `pub use tonic;`
+grpc re-export was dropped in favour of direct use.
 
 Flagged by `security-reviewer` in the Session One red-team pass.
 

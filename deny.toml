@@ -46,6 +46,9 @@ allow = [
     "ISC",
     "BSD-3-Clause",
     "Unicode-3.0",
+    # Pulled by the testcontainers dev-dependency graph (miniz_oxide, via
+    # bollard's compression). Permissive, GPL-3.0-compatible; test-only.
+    "Zlib",
 ]
 
 [sources]
