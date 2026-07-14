@@ -14,7 +14,7 @@
 # release pipeline (left as a tag here so the reference build stays legible).
 
 # ---- Builder ---------------------------------------------------------------
-FROM rust:1.95-bookworm AS builder
+FROM rust:1.97-bookworm AS builder
 
 # protoc is required at build time by tonic-build/prost-build to generate the
 # contract types from the vendored common.proto.
