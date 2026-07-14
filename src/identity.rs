@@ -653,7 +653,10 @@ fn floor_after_renew(base: Duration, remaining: Duration) -> Duration {
 
 /// Apply ±50% jitter to the retry backoff so a fleet that entered backoff together
 /// (e.g. a CP outage) does not retry in lockstep (F5). `sample` is in `[-1, 1]`.
-fn jittered_backoff(base: Duration, sample: f64) -> Duration {
+///
+/// Shared with the S14 Gateway reconnect ([`crate::gateway`]), which has the same
+/// thundering-herd problem for the same reason.
+pub fn jittered_backoff(base: Duration, sample: f64) -> Duration {
     base.mul_f64(1.0 + 0.5 * sample.clamp(-1.0, 1.0))
 }
 

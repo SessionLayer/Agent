@@ -21,10 +21,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # The vendored proto set. common.proto declares no service; agent.proto (S12)
-# declares the AgentIdentity gRPC plane (EnrollAgent / RenewAgentIdentity).
+# declares the AgentIdentity gRPC plane (EnrollAgent / RenewAgentIdentity);
+# agent/v1/wire.proto (S14) carries the Agent<->Gateway wire payloads — not a
+# gRPC service, just the message encodings for the framed WebSocket protocol
+# specified in contracts/wire/agent-gateway-v1.md.
 RELS=(
   "sessionlayer/controlplane/v1/common.proto"
   "sessionlayer/controlplane/v1/agent.proto"
+  "sessionlayer/agent/v1/wire.proto"
 )
 SRC_ROOT="../ControlPlane-API/contracts/proto"
 DST_ROOT="proto"

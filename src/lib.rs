@@ -33,11 +33,13 @@
 #![deny(rust_2018_idioms)]
 
 pub mod config;
+pub mod gateway;
 pub mod identity;
 pub mod join;
 pub mod mtls;
 pub mod privilege;
 mod secret;
+pub mod supervisor;
 pub mod telemetry;
 pub mod tls;
 pub mod version;
@@ -50,6 +52,15 @@ pub mod proto {
     // Generated code is not held to this crate's lint bar.
     #![allow(clippy::all, missing_docs, rustdoc::all)]
     include!(concat!(env!("OUT_DIR"), "/sessionlayer.controlplane.v1.rs"));
+
+    /// The Agent<->Gateway wire payloads (`sessionlayer.agent.v1`), generated from
+    /// the same vendored contract. The Control Plane is not a party to this
+    /// protocol; these are the payloads of the framed WebSocket transport
+    /// (`contracts/wire/agent-gateway-v1.md`), not gRPC.
+    pub mod wire {
+        #![allow(clippy::all, missing_docs, rustdoc::all)]
+        include!(concat!(env!("OUT_DIR"), "/sessionlayer.agent.v1.rs"));
+    }
 }
 
 /// Long-form version string surfaced by `--version`: build SemVer plus the
