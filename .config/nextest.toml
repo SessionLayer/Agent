@@ -1,12 +1,25 @@
 # cargo-nextest configuration for the SessionLayer Agent.
 # https://nexte.st/docs/configuration/
 [profile.default]
-# Surface slow/hung tests early; the scaffold has no long-running tests.
+# Surface slow/hung tests early; unit + in-process tests have no long-running work.
 slow-timeout = { period = "30s", terminate-after = 2 }
 # Show output for failures immediately.
 failure-output = "immediate-final"
 # Any nextest-level warning (e.g. no tests matched a required filter) is fatal.
 fail-fast = false
+
+[test-groups]
+# The Docker E2E tests each stand up containers on `--network host`; running
+# several at once on a small CI box starves them (image builds + SSH handshakes)
+# into false timeouts. Serialise them.
+docker-e2e = { max-threads = 1 }
+
+[[profile.default.overrides]]
+# The node/sshd Docker E2E builds images (apt) and runs a real SSH session, which
+# legitimately exceeds the unit-test slow-timeout. Give it room AND serialise it.
+filter = 'binary(splice_e2e) | binary(docker_e2e)'
+test-group = 'docker-e2e'
+slow-timeout = { period = "180s", terminate-after = 2 }
 
 [profile.ci]
 # CI mirrors default but retries once to absorb rare infra flakes, and emits a

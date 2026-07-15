@@ -11,6 +11,8 @@
 //! caller resolution is by issued-certificate identity.
 #![allow(dead_code)]
 
+pub mod gateway;
+
 use sessionlayer_agent::join::MTLS_JOIN_POP_CONTEXT;
 use sessionlayer_agent::mtls::{self, ChannelParams};
 use sessionlayer_agent::proto::agent_identity_server::{AgentIdentity, AgentIdentityServer};
@@ -71,7 +73,7 @@ impl TestCa {
     }
 
     /// Issue a server leaf (fresh key) with a serverAuth EKU and the given SANs.
-    fn server_leaf(&self, sans: &[&str]) -> (Vec<u8>, String) {
+    pub fn server_leaf(&self, sans: &[&str]) -> (Vec<u8>, String) {
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let mut params =
             rcgen::CertificateParams::new(sans.iter().map(|s| s.to_string()).collect::<Vec<_>>())
@@ -389,6 +391,12 @@ impl MockCp {
         self.state.lock().unwrap().expected_oidc = Some(token.to_string());
     }
 
+    /// Set the TTL of issued certs. `Duration::ZERO` makes every issued cert land
+    /// already-expired (`not_after == now`) — the renew-storm condition (F-renewstorm-1).
+    pub fn set_cert_ttl(&self, ttl: Duration) {
+        self.state.lock().unwrap().cert_ttl = ttl;
+    }
+
     /// Configure the operator public key MtlsJoin PoP is verified against.
     pub fn set_operator_vk(&self, vk: p256::ecdsa::VerifyingKey) {
         self.state.lock().unwrap().expected_operator_vk = Some(vk);
@@ -416,5 +424,12 @@ impl MockCp {
             .unwrap()
             .locked_nodes
             .insert(node_name.to_string());
+    }
+
+    /// Issue a serverAuth leaf from the internal mTLS CA. The test Gateway uses this
+    /// so its server certificate chains to the SAME CA the Agent holds as its trust
+    /// anchor — exactly the production relationship (wire contract §1).
+    pub fn issue_server_leaf(&self, sans: &[&str]) -> (Vec<u8>, String) {
+        self.state.lock().unwrap().ca.server_leaf(sans)
     }
 }

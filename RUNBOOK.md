@@ -82,3 +82,85 @@ No metrics/health surface yet (S13). Until then: alert on the exit codes above a
 on the `SECURITY` / `REPAIR-NEEDED` log lines. Time-to-cert-expiry, renewal
 attempt/failure counters, and the current generation become metrics with the S13
 transport (tracked as Accepted-Risk finding F-observability-1).
+
+---
+
+# S14: outbound connectivity (control channel + dial-back splice)
+
+The Agent now dials **out** to a Gateway over a mutually-authenticated WebSocket
+control channel, receives dial-back requests, and splices each session's byte
+stream to the node's own `sshd` on loopback. A node still needs **zero inbound
+reachability**. The normative protocol is `contracts/wire/agent-gateway-v1.md`.
+
+Enable the role by passing `--gateway-endpoint wss://GW:PORT`. With no
+`--gateway-endpoint` the Agent runs **identity-only** (the S12 posture), which
+stays supported.
+
+## Configuration (clap flags; no config file)
+| flag | default | notes |
+|------|---------|-------|
+| `--gateway-endpoint` (repeatable) | none | `wss://` only; `ws://` is refused. Omit ⇒ identity-only. Repeatable so HA (≥2 diverse Gateways, FR-HA-6) slots in — **this session drives exactly one**. |
+| `--gateway-server-name` | `gateway` | the Gateway's **enrolled name**; the dNSName SAN its serverAuth cert must carry. Verified against the internal CA — dial an address, verify a name. Set to the real enrolled name in prod. |
+| `--splice-addr` | `127.0.0.1:22` | the node's local sshd. **Loopback-validated at startup; the Agent refuses to boot otherwise** (see below). |
+| `--max-concurrent-splices` | 32 | a dial-back beyond the cap is `REFUSED`, never queued. |
+| `--drain-deadline-secs` | 30 | how long live splices may finish after the Agent stops taking new work. |
+
+Reconnect backoff is 1s→30s exponential with ±50% jitter, indefinitely.
+
+## The confused-deputy / SSRF defence (why `--splice-addr` is loopback-only)
+`DIAL_BACK_REQUEST` deliberately carries **no splice target**. The Agent splices
+only to its own locally-configured `--splice-addr`, which is validated to be a
+loopback address (`127.0.0.0/8` or `::1`) at startup — a routable address, the
+wildcard `0.0.0.0`, or a **hostname** (which would hand the destination to DNS) all
+**refuse to start**. So no Gateway — however compromised — can redirect the splice
+or use the Agent as a network pivot into the node's subnet. This is structural, not
+a runtime check on hostile input.
+
+## Non-root holds over the splice (FR-CONN-6 / Design §9.3)
+The Agent runs non-root (`USER 65532`; `require_non_root()` refuses euid 0) and
+therefore **cannot read the node's host key** (`/etc/ssh/ssh_host_*`, root-only).
+Spoofing the node's host identity thus requires **node-root compromise**, not
+merely a compromised Agent — the agent model *raises* that bar. The Gateway's
+no-TOFU host verification is what would catch a splice to an impostor; the Agent is
+not a party to it and cannot weaken it. The Docker E2E asserts the Agent account
+cannot read the host key.
+
+## Node-local sshd second trail (FR-AUD-4) — and why the Agent does NOT forward it
+In the agent model the node's **own** `sshd` log is a **tamper-independent** second
+record of every session. The Gateway's inner-leg certificate carries
+`key_id = session_id + identity`; a node running `LogLevel VERBOSE` (set in the
+canonical `testing/docker/sshd/sshd_config`, and required on real nodes) logs that
+key-id on every accepted certificate. The platform audit trail and this node-local
+trail cross-correlate on `session_id`.
+
+**Log forwarding by the Agent is deliberately OFF.** The entire value of this
+second trail is that it does **not** depend on the Agent: the Agent neither writes
+it nor can suppress it, so it remains trustworthy even if the Agent is compromised.
+Routing it *through* the Agent would collapse that independence. Ship the node's
+sshd log to your SIEM by the **node's** normal log pipeline (journald/syslog →
+collector), never via the Agent. Correlate platform ↔ node on `session_id`.
+
+## Availability: a terminal identity outcome does NOT kill live sessions
+The renew-ahead loop runs **concurrently** with the control channel (spawned, not
+awaited). A terminal identity outcome — clone (exit 3) or repair-needed (exit 4) —
+stops the Agent taking **new** dial-backs and closes the control channel, but a
+**live spliced session is a real user mid-work**: it is drained up to
+`--drain-deadline-secs`, not torn down. The S12 exit codes are unchanged. If you see
+`terminal identity outcome — refusing new sessions and draining live ones`, the
+process will exit with code 3/4 once live sessions end or the drain deadline passes;
+handle it exactly as the S12 clone/repair incident above.
+
+## Symptom: the control channel reconnects in a loop (node flaps offline)
+Each reconnect re-runs the **full** TLS + mTLS + preface — there is no resumption.
+Common causes: (a) the Gateway's serverAuth cert does not chain to the CA the Agent
+holds, or its SAN ≠ `--gateway-server-name` (TLS fails closed — verify properly or
+not at all); (b) a `VERSION_REJECT` (no common protocol version — the Agent will
+**never** downgrade, FR-HA-9); (c) a `HELLO_ACK` proposing a heartbeat outside
+1–300s or `max_frame_bytes` outside 4 KiB–1 MiB (refused, fail closed). The log
+line names which. A node whose Agent is not connected is simply **offline** (§7.1),
+reported post-authorization exactly like an unreachable agentless node.
+
+## Symptom: dial-backs fast-fail with `LOCAL_DIAL_FAILED`
+The node's own `sshd` is down / not listening on `--splice-addr`. The Agent reports
+this immediately (it does not wait out the Gateway's dial-back deadline); the user
+sees the generic §7.1 "target node is offline / unreachable". Check the node sshd.
