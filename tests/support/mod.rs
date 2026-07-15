@@ -270,6 +270,15 @@ impl AgentIdentity for MockSvc {
             return Err(Status::permission_denied("identity locked"));
         }
 
+        // The real CP validates csr.commonName() == node_name on the RENEW path too
+        // (AgentRenewalService), not just enroll — so the renew CSR must carry the CN
+        // (F-enroll-cn-1). Enforce it here so a renew-CSR regression is caught.
+        if csr_common_name(&req.pkcs10_csr).as_deref() != Some(node_name.as_str()) {
+            return Err(Status::invalid_argument(
+                "CSR subject CN does not match identity",
+            ));
+        }
+
         // §8.2 clone detection: a declared generation that does not match the
         // stored one means a cloned credential forked the counter. AUTO-LOCK the
         // identity (and its node) and refuse; never auto-clear.

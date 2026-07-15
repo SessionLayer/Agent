@@ -35,6 +35,15 @@ per-endpoint-SAN and node-id fixtures that hid real behaviour.
    (mirroring the real CP), so the double can no longer mask a SAN-only CSR — with
    the Agent fix in place all enroll/renew ITs pass; without it they would now fail.
 
+**Both enroll AND renew are covered by one fix.** The CP applies the identical
+`CN == node_name` check on the renew path too (`AgentRenewalService`), and the
+Agent's `enroll` and `renew` both build their CSR through the **same**
+`generate_keypair_and_csr` (identity.rs — enroll and renew call sites), so the CN is
+set on both. The key is ECDSA **P-256** on both paths (`PKCS_ECDSA_P256_SHA256`,
+hardcoded — the CP's other mandatory CSR field, which cannot drift). `MockCp`'s
+`renew_agent_identity` now validates the CN as well, so the renew path is a standing
+test, not just enroll.
+
 ## Tests
 - `identity::tests::csr_carries_node_name_as_common_name` (unit): the CSR subject CN
   equals `node_name` (mirrors the Gateway's `csr_carries_a_non_blank_cn`).
