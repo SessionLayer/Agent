@@ -507,7 +507,9 @@ async fn a_hostile_dial_back_endpoint_cannot_be_used_as_a_pivot() {
 // Part F — ≥2 failure-domain-diverse control channels (no mesh) + degrade
 // ---------------------------------------------------------------------------
 
-/// A config holding one channel per Gateway, each in a distinct failure domain.
+/// A config holding one channel per Gateway, each in a distinct failure domain and
+/// verified against **that Gateway's own** serverAuth SAN (distinct per gateway in
+/// production — see `F-ha-agent-servername-1`).
 fn ha_gateway_config(gws: &[&TestGateway], splice_addr: SocketAddr) -> GatewayConfig {
     let endpoints = gws
         .iter()
@@ -515,7 +517,7 @@ fn ha_gateway_config(gws: &[&TestGateway], splice_addr: SocketAddr) -> GatewayCo
         .map(|(i, gw)| GatewayEndpoint {
             url: gw.endpoint(),
             failure_domain: format!("az-{i}"),
-            server_name: GATEWAY_SERVER_NAME.to_string(),
+            server_name: gw.server_name().to_string(),
         })
         .collect();
     GatewayConfig {
@@ -537,10 +539,15 @@ async fn agent_holds_two_diverse_channels_and_survives_losing_one_gateway() {
     // must not disrupt sessions routed through the other.
     let cp = MockCp::start().await;
     let token = "SLDB1.opaque";
+    // DISTINCT serverAuth SANs per gateway (as the real CP stamps them). This is what
+    // makes the test exercise the real diverse-gateway case: with a single shared
+    // `--gateway-server-name`, the Agent would fail to verify gw-b and never register
+    // on it — the bug `F-ha-agent-servername-1` fixes. Same SAN on both would mask it.
     let mut gw_a = TestGateway::start_with(
         &cp,
         GwOptions {
             expect_token: Some(token.to_string()),
+            server_name: Some("gw-a".to_string()),
             ..Default::default()
         },
     )
@@ -549,17 +556,20 @@ async fn agent_holds_two_diverse_channels_and_survives_losing_one_gateway() {
         &cp,
         GwOptions {
             expect_token: Some(token.to_string()),
+            server_name: Some("gw-b".to_string()),
             ..Default::default()
         },
     )
     .await;
+    assert_ne!(gw_a.server_name(), gw_b.server_name());
     let dir = tempfile::tempdir().unwrap();
     let renew = enrolled_agent(&cp, dir.path(), NODE).await;
     let (splice_addr, _) = spawn_echo_listener();
 
     let (_stop, _task) = spawn_client(ha_gateway_config(&[&gw_a, &gw_b], splice_addr), &renew);
 
-    // The Agent registers on BOTH Gateways concurrently.
+    // The Agent registers on BOTH Gateways concurrently — each verified against its
+    // OWN distinct SAN (no TOFU), which only works with the per-endpoint server name.
     gw_a.await_registration().await;
     gw_b.await_registration().await;
 
@@ -597,8 +607,24 @@ async fn a_dial_back_is_refused_unless_its_endpoint_is_the_arriving_channels_gat
     // channel's Gateway — so affinity refuses it before anything is dialled. This
     // stops a compromised gw-A from tasking the Agent to open a connection to gw-B.
     let cp = MockCp::start().await;
-    let mut gw_a = TestGateway::start(&cp).await;
-    let mut gw_b = TestGateway::start(&cp).await;
+    // Distinct SANs per gateway (as in production); the Agent verifies each channel
+    // against its own endpoint's name.
+    let mut gw_a = TestGateway::start_with(
+        &cp,
+        GwOptions {
+            server_name: Some("gw-a".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut gw_b = TestGateway::start_with(
+        &cp,
+        GwOptions {
+            server_name: Some("gw-b".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
     let dir = tempfile::tempdir().unwrap();
     let renew = enrolled_agent(&cp, dir.path(), NODE).await;
     let (splice_addr, splice_hits) = spawn_echo_listener();
