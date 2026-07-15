@@ -32,6 +32,17 @@ pub const DIALBACK_PATH: &str = "/agent/v1/dialback";
 /// A mutually-authenticated WebSocket to a Gateway.
 pub type GatewayWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
+/// The host of a `wss://host:port` endpoint, for the default failure-domain label
+/// (§F): two Gateways on the same host share a failure domain. `None` if the
+/// endpoint is not a valid `wss://` URI with a host.
+pub(crate) fn host_of(endpoint: &str) -> Option<String> {
+    let uri: Uri = endpoint.parse().ok()?;
+    if uri.scheme_str() != Some("wss") {
+        return None;
+    }
+    uri.host().map(|h| h.to_string())
+}
+
 /// Split a `wss://host:port[/...]` endpoint into the authority we dial. The **path
 /// is taken from the contract, never from the endpoint string** — the two roles
 /// have fixed paths (§1), so neither an operator typo nor a hostile

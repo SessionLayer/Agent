@@ -21,8 +21,9 @@ use clap::{Parser, Subcommand};
 use zeroize::Zeroizing;
 
 use sessionlayer_agent::config::{
-    parse_splice_addr, AgentConfig, GatewayConfig, JoinConfig, RenewConfig, DEFAULT_CP_ENDPOINT,
-    DEFAULT_CP_SERVER_NAME, DEFAULT_DATA_DIR, DEFAULT_MAX_CONCURRENT_SPLICES, DEFAULT_SPLICE_ADDR,
+    parse_splice_addr, AgentConfig, GatewayConfig, GatewayEndpoint, JoinConfig, RenewConfig,
+    DEFAULT_CP_ENDPOINT, DEFAULT_CP_SERVER_NAME, DEFAULT_DATA_DIR, DEFAULT_MAX_CONCURRENT_SPLICES,
+    DEFAULT_MIN_CONTROL_CHANNELS, DEFAULT_SPLICE_ADDR,
 };
 use sessionlayer_agent::gateway::GatewayClient;
 use sessionlayer_agent::identity::{self, IdentityStore, RenewAhead, RenewAheadConfig};
@@ -103,18 +104,29 @@ struct RunArgs {
     #[arg(long, default_value_t = 30)]
     rpc_timeout_secs: u64,
 
-    /// Gateway `wss://host:port` to dial OUT to. Repeatable: HA (≥2
-    /// failure-domain-diverse Gateways) slots in here. Omit to run identity-only.
+    /// Gateway `wss://host:port` to dial OUT to. Repeatable: an Agent holds ≥2
+    /// control channels to failure-domain-diverse Gateways (FR-HA-6). Omit to run
+    /// identity-only.
     #[arg(long, value_name = "WSS_URL")]
     gateway_endpoint: Vec<String>,
+    /// Failure-domain label for the corresponding `--gateway-endpoint` (rack / AZ),
+    /// zipped positionally. Provide one per endpoint, or none (each defaults to its
+    /// endpoint host). Two channels must span ≥2 domains (FR-HA-6).
+    #[arg(long, value_name = "LABEL")]
+    gateway_failure_domain: Vec<String>,
     /// The Gateway's enrolled name — the SAN its serverAuth certificate must carry.
     #[arg(long, default_value = DEFAULT_GATEWAY_SERVER_NAME)]
     gateway_server_name: String,
+    /// Degrade-warn threshold: warn when live control channels drop below this
+    /// (FR-HA-6). Default 1 = single-instance (only the all-lost signal); an HA
+    /// operator sets 2+. Diversity of ≥2 endpoints is enforced independently.
+    #[arg(long, default_value_t = DEFAULT_MIN_CONTROL_CHANNELS)]
+    min_control_channels: usize,
     /// The node-local address a dial-back is spliced to. MUST be loopback: the
     /// Agent refuses to start otherwise (the confused-deputy defence).
     #[arg(long, default_value = DEFAULT_SPLICE_ADDR, value_parser = parse_splice_addr)]
     splice_addr: SocketAddr,
-    /// Cap on simultaneous spliced sessions.
+    /// Cap on simultaneous spliced sessions (shared across all control channels).
     #[arg(long, default_value_t = DEFAULT_MAX_CONCURRENT_SPLICES)]
     max_concurrent_splices: usize,
     /// How long live spliced sessions may drain after the Agent stops taking new
@@ -169,22 +181,54 @@ impl RunArgs {
     }
 
     /// The connectivity role, if a Gateway was configured. Absent = identity-only
-    /// (the S12 posture), which stays a supported way to run.
-    fn gateway_config(&self) -> Option<GatewayConfig> {
+    /// (the S12 posture), which stays a supported way to run. `validate()` (called
+    /// by `GatewayClient::new`) enforces the ≥2-diverse-domain rule.
+    fn gateway_config(&self) -> anyhow::Result<Option<GatewayConfig>> {
         if self.gateway_endpoint.is_empty() {
-            return None;
+            return Ok(None);
         }
-        Some(GatewayConfig {
-            endpoints: self.gateway_endpoint.clone(),
+        let endpoints = build_endpoints(&self.gateway_endpoint, &self.gateway_failure_domain)?;
+        Ok(Some(GatewayConfig {
+            endpoints,
             server_name: self.gateway_server_name.clone(),
             splice_addr: self.splice_addr,
             max_concurrent_splices: self.max_concurrent_splices,
+            min_control_channels: self.min_control_channels,
             connect_timeout: Duration::from_secs(self.connect_timeout_secs),
             backoff_initial: Duration::from_secs(1),
             backoff_max: Duration::from_secs(30),
             drain_deadline: Duration::from_secs(self.drain_deadline_secs),
-        })
+        }))
     }
+}
+
+/// Zip endpoints with their failure-domain labels. Either provide one label per
+/// endpoint, or none — in which case each endpoint's failure domain defaults to its
+/// **host** (fail-closed: two Gateways on one host are one domain). A mismatched
+/// count is a startup error, not a silent guess.
+fn build_endpoints(urls: &[String], domains: &[String]) -> anyhow::Result<Vec<GatewayEndpoint>> {
+    if !domains.is_empty() && domains.len() != urls.len() {
+        anyhow::bail!(
+            "{} --gateway-endpoint but {} --gateway-failure-domain: provide one label \
+             per endpoint, or none (each then defaults to its host)",
+            urls.len(),
+            domains.len()
+        );
+    }
+    let mut out = Vec::with_capacity(urls.len());
+    for (i, url) in urls.iter().enumerate() {
+        let failure_domain = match domains.get(i) {
+            Some(label) => label.clone(),
+            None => sessionlayer_agent::gateway::default_failure_domain(url).with_context(|| {
+                format!("{url:?} is not a valid wss:// endpoint (needed to derive a failure domain)")
+            })?,
+        };
+        out.push(GatewayEndpoint {
+            url: url.clone(),
+            failure_domain,
+        });
+    }
+    Ok(out)
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -212,8 +256,9 @@ async fn main() -> anyhow::Result<ExitCode> {
         Some(Command::Run(args)) => {
             let once = args.once;
             // Built (and loopback-validated) BEFORE any credential work, so a bad
-            // splice target fails startup closed rather than after enrolling.
-            let gateway = args.gateway_config();
+            // splice target or too-few diverse channels fails startup closed rather
+            // than after enrolling.
+            let gateway = args.gateway_config()?;
             let config = args.into_config()?;
             run(config, gateway, once).await
         }

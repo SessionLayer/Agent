@@ -11,6 +11,7 @@
 //! authorization. A credential rotation (S12 renew-ahead) reconnects with the new
 //! certificate.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +19,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::config::GatewayConfig;
+use crate::config::{GatewayConfig, GatewayEndpoint};
 use crate::gateway::transport::{self, GatewayWs, CONTROL_PATH};
 use crate::gateway::wire::{self, Inbound, Role};
 use crate::gateway::{GatewayError, Negotiated};
@@ -43,92 +44,36 @@ enum Ended {
     Fault(GatewayError),
 }
 
-/// The Agent's Gateway-facing client: dial out, register, serve dial-backs.
-pub struct GatewayClient {
+/// State shared by every control channel this Agent runs: the config, the renew
+/// handle they all authenticate with, the **global** splice cap (shared across
+/// channels — the node's total concurrent-session budget, not per-Gateway), and the
+/// reachability counter that drives the all-Gateways-lost degrade.
+struct Shared {
     config: Arc<GatewayConfig>,
     renew: RenewHandle,
-    /// Caps concurrent splices. Also the drain latch: when every permit is free,
-    /// no session is live.
+    /// Caps concurrent splices across all channels. Also the drain latch: when every
+    /// permit is free, no session is live.
     splices: Arc<Semaphore>,
+    /// How many control channels are currently registered. When it reaches zero the
+    /// node is unreachable (FR-HA-6 degrade); when it climbs off zero, reachable.
+    reachable: Arc<AtomicUsize>,
+    total_channels: usize,
 }
 
-impl GatewayClient {
-    /// Build the client, validating the configuration (loopback splice target,
-    /// endpoints, caps) **before** anything is dialled — fail closed at startup.
-    pub fn new(
-        config: GatewayConfig,
-        renew: RenewHandle,
-    ) -> Result<Self, crate::config::ConfigError> {
-        config.validate()?;
-        let splices = Arc::new(Semaphore::new(config.max_concurrent_splices));
-        Ok(Self {
-            config: Arc::new(config),
-            renew,
-            splices,
-        })
-    }
-
-    /// Dial out and serve until `stop` is set, reconnecting indefinitely.
-    ///
-    /// On stop the control channel is closed first (so no new dial-back request can
-    /// arrive), then **live splices are drained** up to `drain_deadline` — a
-    /// terminal identity outcome stops *new* work but must not tear down sessions
-    /// that are already carrying a user's SSH stream (contract §7).
-    pub async fn run(self, mut stop: watch::Receiver<bool>) {
-        let endpoint = self.config.endpoints[0].clone();
-        let mut backoff = self.config.backoff_initial;
-
-        tracing::info!(
-            %endpoint,
-            server_name = %self.config.server_name,
-            splice_addr = %self.config.splice_addr,
-            max_concurrent_splices = self.config.max_concurrent_splices,
-            "gateway control channel starting (dial-out)"
-        );
-
-        while !*stop.borrow() {
-            let cred = self.renew.current();
-            match self
-                .serve_once(&endpoint, &cred, &mut stop, &mut backoff)
-                .await
-            {
-                Ended::Stopped => break,
-                Ended::CredentialRotated => {
-                    tracing::info!("credential rotated — reconnecting with the new certificate");
-                    continue;
-                }
-                Ended::Fault(err) => {
-                    let delay = jittered_backoff(backoff, random_sample());
-                    tracing::warn!(
-                        error = %err,
-                        retry_in_ms = delay.as_millis() as u64,
-                        "gateway control channel down — reconnecting"
-                    );
-                    backoff = next_backoff(backoff, self.config.backoff_max);
-                    tokio::select! {
-                        _ = tokio::time::sleep(delay) => {}
-                        _ = stop.changed() => {}
-                    }
-                }
-            }
-        }
-
-        self.drain().await;
-    }
-
+impl Shared {
     /// Wait for live splices to finish, bounded. Acquiring every permit proves no
-    /// session is live.
+    /// session is live. Called once, after all channels have stopped.
     async fn drain(&self) {
         let permits = self.config.max_concurrent_splices as u32;
         let live = permits as usize - self.splices.available_permits();
         if live == 0 {
-            tracing::info!("gateway control channel stopped; no live sessions to drain");
+            tracing::info!("gateway control channels stopped; no live sessions to drain");
             return;
         }
         tracing::info!(
             live,
             deadline_secs = self.config.drain_deadline.as_secs(),
-            "gateway control channel stopped; draining live spliced sessions"
+            "gateway control channels stopped; draining live spliced sessions"
         );
         match tokio::time::timeout(
             self.config.drain_deadline,
@@ -143,21 +88,135 @@ impl GatewayClient {
             ),
         }
     }
+}
+
+/// The Agent's Gateway-facing client. Holds one control channel per configured
+/// endpoint concurrently — for HA, ≥2 to failure-domain-diverse Gateways (FR-HA-6);
+/// for single-instance, exactly one. The Agent does **not** mesh; each channel is an
+/// independent dial-out to one Gateway.
+pub struct GatewayClient {
+    shared: Arc<Shared>,
+}
+
+impl GatewayClient {
+    /// Build the client, validating the configuration (loopback splice target,
+    /// endpoint diversity when multi-homed, caps) **before** anything is dialled —
+    /// fail closed at startup.
+    pub fn new(
+        config: GatewayConfig,
+        renew: RenewHandle,
+    ) -> Result<Self, crate::config::ConfigError> {
+        config.validate()?;
+        let splices = Arc::new(Semaphore::new(config.max_concurrent_splices));
+        let total_channels = config.endpoints.len();
+        Ok(Self {
+            shared: Arc::new(Shared {
+                config: Arc::new(config),
+                renew,
+                splices,
+                reachable: Arc::new(AtomicUsize::new(0)),
+                total_channels,
+            }),
+        })
+    }
+
+    /// Dial out on **all** configured Gateways concurrently and serve until `stop` is
+    /// set, each channel reconnecting indefinitely. When all channels have stopped,
+    /// **live splices are drained** up to `drain_deadline` — a terminal identity
+    /// outcome stops *new* work but must not tear down sessions already carrying a
+    /// user's SSH stream (contract §7).
+    pub async fn run(self, stop: watch::Receiver<bool>) {
+        let shared = self.shared;
+        tracing::info!(
+            channels = shared.total_channels,
+            failure_domains = shared.config.distinct_failure_domains(),
+            server_name = %shared.config.server_name,
+            splice_addr = %shared.config.splice_addr,
+            max_concurrent_splices = shared.config.max_concurrent_splices,
+            "gateway control channels starting (dial-out to diverse Gateways; no mesh)"
+        );
+
+        let mut tasks = Vec::with_capacity(shared.total_channels);
+        for ep in shared.config.endpoints.clone() {
+            // The authority was validated at startup; a failure here is defensive.
+            let authority = match transport::authority_of(&ep.url) {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::error!(endpoint = %ep.url, error = %e, "skipping an unusable endpoint");
+                    continue;
+                }
+            };
+            let channel = ControlChannel {
+                shared: shared.clone(),
+                endpoint: ep,
+                authority,
+            };
+            let stop = stop.clone();
+            tasks.push(tokio::spawn(async move { channel.run(stop).await }));
+        }
+
+        for task in tasks {
+            let _ = task.await;
+        }
+        shared.drain().await;
+    }
+}
+
+/// One control channel: a persistent dial-out to a single Gateway, with its own
+/// reconnect loop. Every channel shares the [`Shared`] state.
+struct ControlChannel {
+    shared: Arc<Shared>,
+    endpoint: GatewayEndpoint,
+    /// This channel's Gateway authority (`host:port`), for the per-channel dial-back
+    /// affinity check.
+    authority: String,
+}
+
+impl ControlChannel {
+    async fn run(self, mut stop: watch::Receiver<bool>) {
+        let mut backoff = self.shared.config.backoff_initial;
+        while !*stop.borrow() {
+            let cred = self.shared.renew.current();
+            match self.serve_once(&cred, &mut stop, &mut backoff).await {
+                Ended::Stopped => break,
+                Ended::CredentialRotated => {
+                    tracing::info!(
+                        endpoint = %self.endpoint.url,
+                        "credential rotated — reconnecting with the new certificate"
+                    );
+                    continue;
+                }
+                Ended::Fault(err) => {
+                    let delay = jittered_backoff(backoff, random_sample());
+                    tracing::warn!(
+                        endpoint = %self.endpoint.url,
+                        error = %err,
+                        retry_in_ms = delay.as_millis() as u64,
+                        "gateway control channel down — reconnecting"
+                    );
+                    backoff = next_backoff(backoff, self.shared.config.backoff_max);
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = stop.changed() => {}
+                    }
+                }
+            }
+        }
+    }
 
     /// One connection: dial, preface, then serve frames until it ends.
     async fn serve_once(
         &self,
-        endpoint: &str,
         cred: &Credential,
         stop: &mut watch::Receiver<bool>,
         backoff: &mut Duration,
     ) -> Ended {
         let mut ws = match transport::connect(
-            endpoint,
-            &self.config.server_name,
+            &self.endpoint.url,
+            &self.shared.config.server_name,
             CONTROL_PATH,
             cred,
-            self.config.connect_timeout,
+            self.shared.config.connect_timeout,
         )
         .await
         {
@@ -165,23 +224,28 @@ impl GatewayClient {
             Err(e) => return Ended::Fault(e),
         };
 
-        let negotiated = match preface(&mut ws, Role::Control, self.config.connect_timeout).await {
-            Ok(n) => n,
-            Err(e) => return Ended::Fault(e),
-        };
+        let negotiated =
+            match preface(&mut ws, Role::Control, self.shared.config.connect_timeout).await {
+                Ok(n) => n,
+                Err(e) => return Ended::Fault(e),
+            };
 
         // A completed preface means the endpoint is healthy: reset the backoff so a
         // channel that later drops redials promptly rather than at the last (grown)
         // interval.
-        *backoff = self.config.backoff_initial;
+        *backoff = self.shared.config.backoff_initial;
+        // Registered = reachable through this Gateway; the guard tracks the fleet-wide
+        // reachability count and logs the all-down degrade when it hits zero.
+        let _registered = Reachability::register(&self.shared, &self.endpoint);
         tracing::info!(
             agent_id = %cred.agent_id,
             node_name = %cred.node_name,
+            endpoint = %self.endpoint.url,
+            failure_domain = %self.endpoint.failure_domain,
             generation = cred.generation,
             protocol = negotiated.version,
             heartbeat_secs = negotiated.heartbeat_interval.as_secs(),
-            max_frame_bytes = negotiated.max_frame_bytes,
-            "registered on the Gateway control channel"
+            "registered on a Gateway control channel"
         );
 
         self.serve_frames(ws, negotiated, cred, stop).await
@@ -198,7 +262,7 @@ impl GatewayClient {
         // Spawned dial-back tasks report their fast-fail outcome here; the control
         // loop is the single writer on this connection.
         let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(16);
-        let mut rotated = self.renew.subscribe();
+        let mut rotated = self.shared.renew.subscribe();
         // Ignore the credential we already hold; only a *change* matters.
         rotated.mark_unchanged();
 
@@ -301,11 +365,19 @@ impl GatewayClient {
 
     /// Decide whether to serve a dial-back, and if so spawn it.
     ///
-    /// Two refusals happen here, before anything is dialled:
+    /// Three refusals happen here, before anything is dialled:
     /// 1. **The node must be ours.** A Gateway must not be able to task this Agent
     ///    for another node; the binding is the `dNSName` SAN of our own certificate
     ///    (`Credential.node_name`), which the CP stamped and we cannot self-assert.
-    /// 2. **Capacity.** Beyond the configured cap we refuse rather than queue.
+    /// 2. **Per-channel affinity (FR-HA-6).** A request that arrived on THIS channel
+    ///    may only dial back to THIS Gateway. In the HA model the node's owning
+    ///    Gateway signals over its own control channel, so the dial-back endpoint
+    ///    always equals the arriving channel. A gw-A that named gw-B's endpoint would
+    ///    be trying to make the Agent open a connection to gw-B — refused. This
+    ///    tightens F-connect-1 (which only required *a* configured Gateway) to *this*
+    ///    channel's Gateway, so a compromised Gateway cannot task the Agent to reach a
+    ///    peer Gateway.
+    /// 3. **Capacity.** Beyond the shared cap we refuse rather than queue.
     fn on_dial_back_request(
         &self,
         req: DialBackRequest,
@@ -331,12 +403,31 @@ impl GatewayClient {
             return;
         }
 
-        let permit: OwnedSemaphorePermit = match self.splices.clone().try_acquire_owned() {
+        let affine = transport::authority_of(&req.dial_back_endpoint)
+            .map(|a| a == self.authority)
+            .unwrap_or(false);
+        if !affine {
+            tracing::warn!(
+                request_id = %request_id.escape_debug(),
+                requested_endpoint = %req.dial_back_endpoint.escape_debug(),
+                channel = %self.authority,
+                "refusing a dial-back whose endpoint is not this control channel's Gateway (affinity)"
+            );
+            refuse(
+                out_tx,
+                negotiated.version,
+                &request_id,
+                DialBackErrorCode::Refused,
+            );
+            return;
+        }
+
+        let permit: OwnedSemaphorePermit = match self.shared.splices.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
                 tracing::warn!(
                     request_id = %request_id.escape_debug(),
-                    cap = self.config.max_concurrent_splices,
+                    cap = self.shared.config.max_concurrent_splices,
                     "refusing a dial-back request: at the concurrent-splice cap"
                 );
                 refuse(
@@ -349,7 +440,7 @@ impl GatewayClient {
             }
         };
 
-        let config = self.config.clone();
+        let config = self.shared.config.clone();
         let cred = cred.clone();
         let out_tx = out_tx.clone();
         let version = negotiated.version;
@@ -403,6 +494,67 @@ impl GatewayClient {
                 "splice closed"
             );
         });
+    }
+}
+
+/// Tracks fleet-wide reachability for the FR-HA-6 degrade. One is held for the
+/// lifetime of a registered connection; the count is the number of currently-
+/// registered control channels. **0 live channels is the hard degrade**: the node
+/// is unreachable and callers must fall back to out-of-band tooling (there is
+/// deliberately no bespoke fallback — the value of diverse channels is that all-lost
+/// is rare). Dropping **below `min_control_channels`** (but still >0) warns that the
+/// operator's requested redundancy is lost — for single-instance (min 1) the only
+/// signal is the all-lost one, which is correct.
+struct Reachability<'a> {
+    shared: &'a Shared,
+}
+
+impl<'a> Reachability<'a> {
+    fn register(shared: &'a Shared, endpoint: &GatewayEndpoint) -> Self {
+        let now = shared.reachable.fetch_add(1, Ordering::SeqCst) + 1;
+        if now == 1 {
+            tracing::info!(
+                endpoint = %endpoint.url,
+                "node is reachable: a Gateway control channel is up"
+            );
+        }
+        if now == shared.config.min_control_channels && shared.config.min_control_channels > 1 {
+            tracing::info!(
+                connected = now,
+                "control-channel redundancy restored to the configured minimum"
+            );
+        }
+        tracing::debug!(
+            connected = now,
+            of = shared.total_channels,
+            "control channels up"
+        );
+        Self { shared }
+    }
+}
+
+impl Drop for Reachability<'_> {
+    fn drop(&mut self) {
+        let now = self.shared.reachable.fetch_sub(1, Ordering::SeqCst) - 1;
+        if now == 0 {
+            tracing::error!(
+                "ALL Gateway control channels are down — this node is UNREACHABLE. \
+                 Degrade to out-of-band tooling (FR-HA-6); new sessions get the §7.1 \
+                 'node offline / unreachable' outcome until a channel recovers"
+            );
+        } else if now < self.shared.config.min_control_channels {
+            tracing::warn!(
+                connected = now,
+                min = self.shared.config.min_control_channels,
+                "a control channel dropped below the configured minimum redundancy"
+            );
+        } else {
+            tracing::debug!(
+                connected = now,
+                of = self.shared.total_channels,
+                "a control channel dropped"
+            );
+        }
     }
 }
 
