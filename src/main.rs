@@ -114,9 +114,12 @@ struct RunArgs {
     /// endpoint host). Two channels must span ≥2 domains (FR-HA-6).
     #[arg(long, value_name = "LABEL")]
     gateway_failure_domain: Vec<String>,
-    /// The Gateway's enrolled name — the SAN its serverAuth certificate must carry.
-    #[arg(long, default_value = DEFAULT_GATEWAY_SERVER_NAME)]
-    gateway_server_name: String,
+    /// The enrolled name whose serverAuth SAN the Agent verifies for the
+    /// corresponding `--gateway-endpoint`, zipped positionally. Provide one per
+    /// endpoint (distinct real Gateways carry distinct SANs), or exactly one to apply
+    /// to all, or none to default every endpoint to `gateway`.
+    #[arg(long, value_name = "NAME")]
+    gateway_server_name: Vec<String>,
     /// Degrade-warn threshold: warn when live control channels drop below this
     /// (FR-HA-6). Default 1 = single-instance (only the all-lost signal); an HA
     /// operator sets 2+. Diversity of ≥2 endpoints is enforced independently.
@@ -187,10 +190,13 @@ impl RunArgs {
         if self.gateway_endpoint.is_empty() {
             return Ok(None);
         }
-        let endpoints = build_endpoints(&self.gateway_endpoint, &self.gateway_failure_domain)?;
+        let endpoints = build_endpoints(
+            &self.gateway_endpoint,
+            &self.gateway_failure_domain,
+            &self.gateway_server_name,
+        )?;
         Ok(Some(GatewayConfig {
             endpoints,
-            server_name: self.gateway_server_name.clone(),
             splice_addr: self.splice_addr,
             max_concurrent_splices: self.max_concurrent_splices,
             min_control_channels: self.min_control_channels,
@@ -202,33 +208,60 @@ impl RunArgs {
     }
 }
 
-/// Zip endpoints with their failure-domain labels. Either provide one label per
-/// endpoint, or none — in which case each endpoint's failure domain defaults to its
-/// **host** (fail-closed: two Gateways on one host are one domain). A mismatched
-/// count is a startup error, not a silent guess.
-fn build_endpoints(urls: &[String], domains: &[String]) -> anyhow::Result<Vec<GatewayEndpoint>> {
-    if !domains.is_empty() && domains.len() != urls.len() {
-        anyhow::bail!(
-            "{} --gateway-endpoint but {} --gateway-failure-domain: provide one label \
-             per endpoint, or none (each then defaults to its host)",
-            urls.len(),
-            domains.len()
-        );
-    }
+/// Zip endpoints with their failure-domain labels and verified server names.
+///
+/// A positional list (`--gateway-failure-domain`, `--gateway-server-name`) must have
+/// either one entry per endpoint, exactly one (applied to all), or none. A mismatched
+/// count is a startup error, not a silent guess. Defaults: failure domain = the
+/// endpoint host (fail-closed — two Gateways on one host are one domain); server name
+/// = `gateway`.
+fn build_endpoints(
+    urls: &[String],
+    domains: &[String],
+    server_names: &[String],
+) -> anyhow::Result<Vec<GatewayEndpoint>> {
+    check_zip("--gateway-failure-domain", urls.len(), domains.len())?;
+    check_zip("--gateway-server-name", urls.len(), server_names.len())?;
+
     let mut out = Vec::with_capacity(urls.len());
     for (i, url) in urls.iter().enumerate() {
-        let failure_domain = match domains.get(i) {
+        let failure_domain = match zipped(domains, i) {
             Some(label) => label.clone(),
             None => sessionlayer_agent::gateway::default_failure_domain(url).with_context(|| {
                 format!("{url:?} is not a valid wss:// endpoint (needed to derive a failure domain)")
             })?,
         };
+        let server_name = zipped(server_names, i)
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_GATEWAY_SERVER_NAME.to_string());
         out.push(GatewayEndpoint {
             url: url.clone(),
             failure_domain,
+            server_name,
         });
     }
     Ok(out)
+}
+
+/// A positional list is valid at 0, 1, or `endpoints` entries.
+fn check_zip(flag: &str, endpoints: usize, given: usize) -> anyhow::Result<()> {
+    if given > 1 && given != endpoints {
+        anyhow::bail!(
+            "{endpoints} --gateway-endpoint but {given} {flag}: provide one per endpoint, \
+             exactly one (applied to all), or none"
+        );
+    }
+    Ok(())
+}
+
+/// The value for endpoint `i` from a positional list: the i-th if per-endpoint, the
+/// single value if one-applies-to-all, else `None`.
+fn zipped(values: &[String], i: usize) -> Option<&String> {
+    match values.len() {
+        0 => None,
+        1 => Some(&values[0]),
+        _ => values.get(i),
+    }
 }
 
 #[tokio::main(flavor = "multi_thread")]

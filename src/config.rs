@@ -166,9 +166,10 @@ impl Default for RenewConfig {
     }
 }
 
-/// One Gateway control-channel target: where to dial, and which **failure domain**
-/// it lives in. The Agent holds a channel to each and requires ≥2 distinct domains
-/// (FR-HA-6) so losing one domain never strands the node.
+/// One Gateway control-channel target: where to dial, which **failure domain** it
+/// lives in, and the **enrolled name** whose serverAuth SAN the Agent verifies. The
+/// Agent holds a channel to each and requires ≥2 distinct domains (FR-HA-6) so losing
+/// one domain never strands the node.
 #[derive(Debug, Clone)]
 pub struct GatewayEndpoint {
     /// The `wss://host:port` address to dial out to.
@@ -177,6 +178,11 @@ pub struct GatewayEndpoint {
     /// in the same domain are not diverse; the default is the endpoint's **host**,
     /// so two Gateways on one host are correctly treated as one domain (fail-closed).
     pub failure_domain: String,
+    /// This Gateway's **enrolled name** — the dNSName SAN its serverAuth leaf must
+    /// carry (the CP stamps it, uniquely per gateway). Dial an address, verify a
+    /// name: the address never authorises anything, and no TOFU. Per-endpoint because
+    /// distinct real Gateways carry distinct SANs.
+    pub server_name: String,
 }
 
 /// The Agent's outbound-connectivity configuration (S14; HA channels S15): the
@@ -184,12 +190,9 @@ pub struct GatewayEndpoint {
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
     /// Gateway endpoints to dial **out** to (FR-HA-6). The Agent holds one control
-    /// channel per endpoint concurrently — it does **not** mesh.
+    /// channel per endpoint concurrently — it does **not** mesh. Each carries its own
+    /// verified `server_name`.
     pub endpoints: Vec<GatewayEndpoint>,
-    /// The Gateway's enrolled name — the dNSName SAN its **serverAuth** leaf must
-    /// carry. Dial an address, verify a name: the address never authorises anything
-    /// (no TOFU on this path either).
-    pub server_name: String,
     /// The node-local address the dial-back is spliced to. **Loopback-validated at
     /// startup** ([`parse_splice_addr`]); nothing on the wire can change it.
     pub splice_addr: SocketAddr,
@@ -230,14 +233,17 @@ impl GatewayConfig {
                 reason: "must be at least 1".to_string(),
             });
         }
-        if self.server_name.is_empty() {
-            return Err(ConfigError::Missing("--gateway-server-name".to_string()));
-        }
-
         // Two Gateways at the same authority are not two channels; a duplicate is a
-        // config error, not silent single-homing dressed up as HA.
+        // config error, not silent single-homing dressed up as HA. Each endpoint must
+        // also carry a server name to verify (no TOFU).
         let mut authorities: Vec<String> = Vec::with_capacity(self.endpoints.len());
         for ep in &self.endpoints {
+            if ep.server_name.is_empty() {
+                return Err(ConfigError::Missing(format!(
+                    "--gateway-server-name for {}",
+                    ep.url
+                )));
+            }
             let auth = crate::gateway::transport::authority_of(&ep.url).map_err(|e| {
                 ConfigError::Invalid {
                     field: "--gateway-endpoint".to_string(),
@@ -432,6 +438,7 @@ mod tests {
         GatewayEndpoint {
             url: url.to_string(),
             failure_domain: domain.to_string(),
+            server_name: "gateway.test".to_string(),
         }
     }
 
@@ -442,7 +449,6 @@ mod tests {
                 endpoint("wss://gw-a.test:8443", "az-a"),
                 endpoint("wss://gw-b.test:8443", "az-b"),
             ],
-            server_name: "gateway.test".to_string(),
             splice_addr,
             max_concurrent_splices: DEFAULT_MAX_CONCURRENT_SPLICES,
             min_control_channels: DEFAULT_MIN_CONTROL_CHANNELS,
@@ -515,6 +521,22 @@ mod tests {
     }
 
     #[test]
+    fn each_endpoint_carries_its_own_verified_server_name() {
+        // Real distinct Gateways have distinct serverAuth SANs — the Agent verifies
+        // each channel against its OWN endpoint's name (no TOFU), and refuses an
+        // endpoint with no name.
+        let addr = parse_splice_addr(DEFAULT_SPLICE_ADDR).unwrap();
+        let mut cfg = gateway_config(addr);
+        cfg.endpoints[0].server_name = "gw-a-ha".to_string();
+        cfg.endpoints[1].server_name = "gw-b-ha".to_string();
+        cfg.validate().unwrap();
+        assert_ne!(cfg.endpoints[0].server_name, cfg.endpoints[1].server_name);
+
+        cfg.endpoints[1].server_name.clear();
+        assert!(matches!(cfg.validate(), Err(ConfigError::Missing(_))));
+    }
+
+    #[test]
     fn splice_target_refuses_non_loopback_hostname_and_wildcard() {
         // The SSRF / confused-deputy defence (contract §5). A routable address
         // would make the Agent a network pivot; the wildcard is not a destination;
@@ -547,7 +569,7 @@ mod tests {
         ));
 
         let mut no_name = gateway_config(addr);
-        no_name.server_name.clear();
+        no_name.endpoints[0].server_name.clear();
         assert!(matches!(no_name.validate(), Err(ConfigError::Missing(_))));
 
         let mut no_splices = gateway_config(addr);

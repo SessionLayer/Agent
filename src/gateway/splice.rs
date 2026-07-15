@@ -49,18 +49,20 @@ const HALF_CLOSE_DRAIN: Duration = Duration::from_secs(10);
 /// ("target node is offline / unreachable") — this never reaches them.
 type Failure = (DialBackErrorCode, GatewayError);
 
-/// Whether a wire-supplied `dial_back_endpoint` is one of the Gateways this Agent
-/// was configured to reach (authority match). A malformed endpoint is not
-/// configured. See the confused-deputy note in [`dial_back`].
-fn endpoint_is_configured(config: &GatewayConfig, endpoint: &str) -> bool {
-    let Ok(wanted) = transport::authority_of(endpoint) else {
-        return false;
-    };
+/// The configured Gateway whose authority matches a wire-supplied
+/// `dial_back_endpoint`, or `None` if it is not one the Agent was configured to
+/// reach (a malformed endpoint is never configured). The match yields the endpoint's
+/// **verified server name** so the dial-back is checked against the right SAN. See
+/// the confused-deputy note in [`dial_back`].
+fn configured_endpoint<'a>(
+    config: &'a GatewayConfig,
+    endpoint: &str,
+) -> Option<&'a crate::config::GatewayEndpoint> {
+    let wanted = transport::authority_of(endpoint).ok()?;
     config
         .endpoints
         .iter()
-        .filter_map(|e| transport::authority_of(&e.url).ok())
-        .any(|a| a == wanted)
+        .find(|e| transport::authority_of(&e.url).ok().as_deref() == Some(wanted.as_str()))
 }
 
 /// A dial-back that has reached `STREAM_OPEN`: the Gateway accepted the token and
@@ -105,7 +107,7 @@ pub async fn dial_back(
     // TCP connect + TLS ClientHello at any address the node can reach (a weak but
     // real network-pivot / recon primitive), even though the TLS handshake itself
     // would then fail closed against the pinned CA. Refuse before dialling.
-    if !endpoint_is_configured(config, &req.dial_back_endpoint) {
+    let Some(gateway) = configured_endpoint(config, &req.dial_back_endpoint) else {
         tracing::warn!(
             request_id = %request_id.escape_debug(),
             endpoint = %req.dial_back_endpoint.escape_debug(),
@@ -118,11 +120,12 @@ pub async fn dial_back(
                 reason: "not among the configured --gateway-endpoint set".to_string(),
             },
         ));
-    }
+    };
 
+    // Verify the dial-back Gateway against ITS own enrolled name (no TOFU).
     let mut ws = transport::connect(
         &req.dial_back_endpoint,
-        &config.server_name,
+        &gateway.server_name,
         DIALBACK_PATH,
         cred,
         config.connect_timeout,
@@ -422,9 +425,9 @@ mod tests {
                 .map(|s| crate::config::GatewayEndpoint {
                     url: s.to_string(),
                     failure_domain: s.to_string(),
+                    server_name: "gateway".to_string(),
                 })
                 .collect(),
-            server_name: "gateway".to_string(),
             splice_addr: "127.0.0.1:22".parse().unwrap(),
             max_concurrent_splices: 32,
             min_control_channels: 1,
@@ -443,11 +446,10 @@ mod tests {
         let config = config_with(&["wss://gw-a.example:8443", "wss://gw-b.example:8443"]);
 
         // Same host:port (any path) is allowed — the path is contract-fixed anyway.
-        assert!(endpoint_is_configured(
-            &config,
-            "wss://gw-a.example:8443/agent/v1/dialback"
-        ));
-        assert!(endpoint_is_configured(&config, "wss://gw-b.example:8443"));
+        assert!(
+            configured_endpoint(&config, "wss://gw-a.example:8443/agent/v1/dialback").is_some()
+        );
+        assert!(configured_endpoint(&config, "wss://gw-b.example:8443").is_some());
 
         // Anything not in the configured set is refused: a different host, a
         // different port, a bare IP, loopback, link-local metadata, or garbage.
@@ -461,7 +463,7 @@ mod tests {
             "ws://gw-a.example:8443",
         ] {
             assert!(
-                !endpoint_is_configured(&config, pivot),
+                configured_endpoint(&config, pivot).is_none(),
                 "{pivot} must not be treated as a configured Gateway"
             );
         }

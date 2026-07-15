@@ -77,8 +77,8 @@ fn gateway_config(gw: &TestGateway, splice_addr: SocketAddr) -> GatewayConfig {
         endpoints: vec![GatewayEndpoint {
             url: gw.endpoint(),
             failure_domain: "az-a".to_string(),
+            server_name: GATEWAY_SERVER_NAME.to_string(),
         }],
-        server_name: GATEWAY_SERVER_NAME.to_string(),
         splice_addr,
         max_concurrent_splices: 32,
         min_control_channels: 1,
@@ -515,11 +515,11 @@ fn ha_gateway_config(gws: &[&TestGateway], splice_addr: SocketAddr) -> GatewayCo
         .map(|(i, gw)| GatewayEndpoint {
             url: gw.endpoint(),
             failure_domain: format!("az-{i}"),
+            server_name: GATEWAY_SERVER_NAME.to_string(),
         })
         .collect();
     GatewayConfig {
         endpoints,
-        server_name: GATEWAY_SERVER_NAME.to_string(),
         splice_addr,
         max_concurrent_splices: 32,
         min_control_channels: 2,
