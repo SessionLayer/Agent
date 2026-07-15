@@ -7,7 +7,7 @@
 
 mod support;
 
-use sessionlayer_agent::identity::{self, IdentityStore};
+use sessionlayer_agent::identity::{self, IdentityStore, RenewAhead, RenewAheadConfig};
 use sessionlayer_agent::join::{MtlsJoin, OidcJoin, TokenJoin};
 use std::time::Duration;
 use support::MockCp;
@@ -294,4 +294,61 @@ async fn locked_node_fails_closed_for_renew_and_reenroll() {
     .await
     .expect_err("re-join of a locked node must be refused");
     assert!(matches!(reenroll_err, identity::IdentityError::Rpc(_)));
+}
+
+/// F-renewstorm-1 (regression guard): when the Control Plane issues certificates
+/// with no remaining validity (a TTL shorter than the clock-skew backdate, or a CP
+/// clock ahead of the node), the renew-ahead loop must NOT renew back-to-back and
+/// storm the CP / burn generations. The post-renewal floor holds it to ≈1/min.
+///
+/// Without the fix the loop sleeps zero and renews as fast as the RPC completes over
+/// loopback — hundreds of generations in the observation window. With the fix it
+/// renews once, then floors, so only a handful of generations elapse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn renew_loop_does_not_storm_when_the_cp_issues_expired_certs() {
+    let cp = MockCp::start().await;
+    cp.set_cert_ttl(Duration::ZERO); // every issued cert lands already-expired
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = IdentityStore::open(dir.path()).unwrap();
+    let params = cp.channel_params(CT, RT);
+    let cred = identity::enroll(
+        &store,
+        &params,
+        &cp.bootstrap_anchors(),
+        &TokenJoin::new(cp.mint_token()),
+        "node-storm",
+    )
+    .await
+    .expect("enrollment (already-expired cert)");
+    let agent_id = cred.agent_id.clone();
+
+    let renew = RenewAhead::new(
+        store,
+        RenewAheadConfig {
+            renew_ahead_fraction: 2.0 / 3.0,
+            renew_jitter_fraction: 0.1,
+            retry_backoff: Duration::from_secs(1),
+            channel: params,
+        },
+        cred,
+    );
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let loop_task = tokio::spawn(renew.run(Box::pin(async move {
+        let _ = stop_rx.await;
+    })));
+
+    // Real time: with the floor the loop renews ~once then sleeps 60s. A storm would
+    // rack up hundreds of generations over this window.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let _ = stop_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(5), loop_task).await;
+
+    let gen = cp.recorded_generation(&agent_id).expect("agent is known");
+    assert!(
+        (1..=5).contains(&gen),
+        "the renew loop must renew a bounded number of times under the storm \
+         condition (got generation {gen}); the floor prevents a back-to-back storm"
+    );
 }

@@ -11,6 +11,7 @@
 //!
 //! The dial-back data path arrives in Session Thirteen.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
@@ -20,12 +21,16 @@ use clap::{Parser, Subcommand};
 use zeroize::Zeroizing;
 
 use sessionlayer_agent::config::{
-    AgentConfig, JoinConfig, RenewConfig, DEFAULT_CP_ENDPOINT, DEFAULT_CP_SERVER_NAME,
-    DEFAULT_DATA_DIR,
+    parse_splice_addr, AgentConfig, GatewayConfig, JoinConfig, RenewConfig, DEFAULT_CP_ENDPOINT,
+    DEFAULT_CP_SERVER_NAME, DEFAULT_DATA_DIR, DEFAULT_MAX_CONCURRENT_SPLICES, DEFAULT_SPLICE_ADDR,
 };
+use sessionlayer_agent::gateway::GatewayClient;
 use sessionlayer_agent::identity::{self, IdentityStore, RenewAhead, RenewAheadConfig};
 use sessionlayer_agent::mtls::ChannelParams;
-use sessionlayer_agent::{init_process, privilege, telemetry, version, LONG_VERSION};
+use sessionlayer_agent::{init_process, privilege, supervisor, telemetry, version, LONG_VERSION};
+
+/// Default Gateway enrolled name (dev; overridden in every real deploy).
+const DEFAULT_GATEWAY_SERVER_NAME: &str = "gateway";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -98,7 +103,27 @@ struct RunArgs {
     #[arg(long, default_value_t = 30)]
     rpc_timeout_secs: u64,
 
-    /// Enroll/renew once and exit (no renew-ahead loop). Used by CI/E2E.
+    /// Gateway `wss://host:port` to dial OUT to. Repeatable: HA (≥2
+    /// failure-domain-diverse Gateways) slots in here. Omit to run identity-only.
+    #[arg(long, value_name = "WSS_URL")]
+    gateway_endpoint: Vec<String>,
+    /// The Gateway's enrolled name — the SAN its serverAuth certificate must carry.
+    #[arg(long, default_value = DEFAULT_GATEWAY_SERVER_NAME)]
+    gateway_server_name: String,
+    /// The node-local address a dial-back is spliced to. MUST be loopback: the
+    /// Agent refuses to start otherwise (the confused-deputy defence).
+    #[arg(long, default_value = DEFAULT_SPLICE_ADDR, value_parser = parse_splice_addr)]
+    splice_addr: SocketAddr,
+    /// Cap on simultaneous spliced sessions.
+    #[arg(long, default_value_t = DEFAULT_MAX_CONCURRENT_SPLICES)]
+    max_concurrent_splices: usize,
+    /// How long live spliced sessions may drain after the Agent stops taking new
+    /// work (shutdown, or a terminal identity outcome).
+    #[arg(long, default_value_t = 30)]
+    drain_deadline_secs: u64,
+
+    /// Enroll/renew once and exit (no renew-ahead loop, no control channel).
+    /// Used by CI/E2E.
     #[arg(long)]
     once: bool,
 }
@@ -142,6 +167,24 @@ impl RunArgs {
             renew: RenewConfig::default(),
         })
     }
+
+    /// The connectivity role, if a Gateway was configured. Absent = identity-only
+    /// (the S12 posture), which stays a supported way to run.
+    fn gateway_config(&self) -> Option<GatewayConfig> {
+        if self.gateway_endpoint.is_empty() {
+            return None;
+        }
+        Some(GatewayConfig {
+            endpoints: self.gateway_endpoint.clone(),
+            server_name: self.gateway_server_name.clone(),
+            splice_addr: self.splice_addr,
+            max_concurrent_splices: self.max_concurrent_splices,
+            connect_timeout: Duration::from_secs(self.connect_timeout_secs),
+            backoff_initial: Duration::from_secs(1),
+            backoff_max: Duration::from_secs(30),
+            drain_deadline: Duration::from_secs(self.drain_deadline_secs),
+        })
+    }
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -168,8 +211,11 @@ async fn main() -> anyhow::Result<ExitCode> {
     match cli.command {
         Some(Command::Run(args)) => {
             let once = args.once;
+            // Built (and loopback-validated) BEFORE any credential work, so a bad
+            // splice target fails startup closed rather than after enrolling.
+            let gateway = args.gateway_config();
             let config = args.into_config()?;
-            run(config, once).await
+            run(config, gateway, once).await
         }
         None => {
             let info = version::component_info();
@@ -201,10 +247,15 @@ fn exit_code(outcome: identity::RenewOutcome) -> ExitCode {
 }
 
 /// Open the data-dir (single-writer lock), load-or-enroll the identity, then run
-/// the renew-ahead loop until shutdown (unless `once`). Returns the process exit
-/// code: `SUCCESS` on clean shutdown / `--once`, a distinct non-zero code on a
-/// terminal/security loop stop (see [`exit_code`]).
-async fn run(config: AgentConfig, once: bool) -> anyhow::Result<ExitCode> {
+/// the renew-ahead loop **and** the Gateway control channel concurrently until
+/// shutdown (unless `once`). Returns the process exit code: `SUCCESS` on clean
+/// shutdown / `--once`, a distinct non-zero code on a terminal/security loop stop
+/// (see [`exit_code`]).
+async fn run(
+    config: AgentConfig,
+    gateway: Option<GatewayConfig>,
+    once: bool,
+) -> anyhow::Result<ExitCode> {
     let store = IdentityStore::open(&config.data_dir)
         .with_context(|| format!("opening credential data-dir {:?}", config.data_dir))?;
     let params = config.channel_params();
@@ -258,7 +309,22 @@ async fn run(config: AgentConfig, once: bool) -> anyhow::Result<ExitCode> {
         },
         cred,
     );
-    let outcome = renew.run(Box::pin(shutdown_signal())).await;
+
+    // Grab the handle BEFORE `run` consumes the driver: the control channel needs
+    // it to observe credential rotation and reconnect with the new certificate.
+    let drain_deadline = gateway
+        .as_ref()
+        .map(|g| g.drain_deadline)
+        .unwrap_or_default();
+    let client = match gateway {
+        Some(cfg) => Some(GatewayClient::new(cfg, renew.handle())?),
+        None => {
+            tracing::info!("no --gateway-endpoint configured — running identity-only");
+            None
+        }
+    };
+
+    let outcome = supervisor::run(renew, client, drain_deadline, shutdown_signal()).await;
     Ok(exit_code(outcome))
 }
 

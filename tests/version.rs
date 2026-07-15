@@ -41,6 +41,27 @@ fn supported_protocol_range_is_exactly_1_0() {
 }
 
 #[test]
+fn wire_protocol_range_is_exactly_1_0() {
+    // F-wireversion-2: the Agent↔Gateway WIRE protocol is fixed at 1.0 and is a
+    // SEPARATE constant from the gRPC/component version, so a later gRPC bump can
+    // never make the wire HELLO advertise a wire version this build cannot speak.
+    assert_eq!(
+        version::WIRE_PROTOCOL_MIN,
+        ProtocolVersion { major: 1, minor: 0 }
+    );
+    assert_eq!(
+        version::WIRE_PROTOCOL_MAX,
+        ProtocolVersion { major: 1, minor: 0 }
+    );
+    assert_eq!(version::WIRE_PROTOCOL_MIN, version::WIRE_PROTOCOL_MAX);
+
+    let info = version::wire_component_info();
+    assert_eq!(info.name, "SessionLayer Agent");
+    assert_eq!(info.protocol_min, Some(version::WIRE_PROTOCOL_MIN));
+    assert_eq!(info.protocol_max, Some(version::WIRE_PROTOCOL_MAX));
+}
+
+#[test]
 fn display_version_formats_major_minor() {
     assert_eq!(
         version::display_version(&ProtocolVersion { major: 1, minor: 0 }),
@@ -64,12 +85,13 @@ fn version_info_serialises_to_stable_json() {
 
 #[test]
 fn long_version_string_matches_numeric_constants() {
-    // Guard against the hand-written `--version` banner drifting from the
-    // numeric protocol constants.
+    // Guard against the hand-written `--version` banner drifting from the numeric
+    // constants. The banner's line is the WIRE protocol (it cites
+    // agent-gateway-v1.md), so it tracks the WIRE constants, not the gRPC ones.
     let expected_range = format!(
         "{} - {}",
-        version::display_version(&version::PROTOCOL_MIN),
-        version::display_version(&version::PROTOCOL_MAX)
+        version::display_version(&version::WIRE_PROTOCOL_MIN),
+        version::display_version(&version::WIRE_PROTOCOL_MAX)
     );
     assert!(
         sessionlayer_agent::LONG_VERSION.contains(&expected_range),

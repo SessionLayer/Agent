@@ -9,6 +9,7 @@
 
 use crate::join::{JoinMethod, MtlsJoin, OidcJoin, TokenJoin};
 use crate::mtls::ChannelParams;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use zeroize::Zeroizing;
@@ -20,6 +21,11 @@ pub const DEFAULT_DATA_DIR: &str = "/var/lib/sessionlayer-agent";
 pub const DEFAULT_CP_ENDPOINT: &str = "https://127.0.0.1:9443";
 /// Default server name the CP server certificate must carry (SNI + SAN).
 pub const DEFAULT_CP_SERVER_NAME: &str = "controlplane";
+
+/// Default splice target: the node's own `sshd`, on loopback (Design §9.2).
+pub const DEFAULT_SPLICE_ADDR: &str = "127.0.0.1:22";
+/// Default cap on simultaneous spliced sessions this Agent will serve.
+pub const DEFAULT_MAX_CONCURRENT_SPLICES: usize = 32;
 
 /// A configuration error (missing/invalid material). Fails startup closed.
 #[derive(Debug, thiserror::Error)]
@@ -153,6 +159,93 @@ impl Default for RenewConfig {
     }
 }
 
+/// The Agent's outbound-connectivity configuration (S14): the Gateway control
+/// channel, and the local splice target the dial-back is joined to.
+#[derive(Debug, Clone)]
+pub struct GatewayConfig {
+    /// Gateway `wss://host:port` endpoints to dial **out** to. Repeatable so HA
+    /// (≥2 failure-domain-diverse Gateways, FR-HA-6) slots in; this session drives
+    /// exactly one channel.
+    pub endpoints: Vec<String>,
+    /// The Gateway's enrolled name — the dNSName SAN its **serverAuth** leaf must
+    /// carry. Dial an address, verify a name: the address never authorises anything
+    /// (no TOFU on this path either).
+    pub server_name: String,
+    /// The node-local address the dial-back is spliced to. **Loopback-validated at
+    /// startup** ([`parse_splice_addr`]); nothing on the wire can change it.
+    pub splice_addr: SocketAddr,
+    /// Cap on simultaneous spliced sessions (a dial-back beyond it is REFUSED).
+    pub max_concurrent_splices: usize,
+    /// Bound on TCP connect + TLS handshake + the connection preface.
+    pub connect_timeout: Duration,
+    /// First reconnect backoff step; doubles up to [`Self::backoff_max`], ±50%
+    /// jitter, indefinitely (§7).
+    pub backoff_initial: Duration,
+    pub backoff_max: Duration,
+    /// How long live splices may keep running after the Agent has stopped taking
+    /// new work (a terminal identity outcome, or shutdown) before they are cut.
+    pub drain_deadline: Duration,
+}
+
+impl GatewayConfig {
+    /// Reject a configuration that could not be served safely. Fails startup closed
+    /// rather than coming up in a degraded posture.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.endpoints.is_empty() {
+            return Err(ConfigError::Missing("--gateway-endpoint".to_string()));
+        }
+        if self.max_concurrent_splices == 0 {
+            return Err(ConfigError::Invalid {
+                field: "--max-concurrent-splices".to_string(),
+                reason: "must be at least 1".to_string(),
+            });
+        }
+        if self.server_name.is_empty() {
+            return Err(ConfigError::Missing("--gateway-server-name".to_string()));
+        }
+        // Defence in depth: the splice address is loopback-validated where it is
+        // parsed, but re-assert it here so no construction path can bypass it.
+        require_loopback(self.splice_addr)
+    }
+}
+
+/// Parse and **validate** the splice target: it MUST be a literal loopback socket
+/// address (`127.0.0.0/8` or `::1`).
+///
+/// This is the confused-deputy / SSRF defence (contract §5), and it is structural
+/// rather than a check on hostile input: `DIAL_BACK_REQUEST` deliberately carries
+/// no target, so the Agent's splice destination comes only from its own local
+/// configuration. A Gateway — however compromised — cannot redirect the splice or
+/// use the Agent as a network pivot into the node's subnet.
+///
+/// A hostname is refused too: it would be resolved at dial time, which hands the
+/// destination to whatever answers DNS, and a name that resolves to loopback today
+/// can resolve elsewhere tomorrow.
+pub fn parse_splice_addr(raw: &str) -> Result<SocketAddr, ConfigError> {
+    let addr: SocketAddr = raw.parse().map_err(|_| ConfigError::Invalid {
+        field: "--splice-addr".to_string(),
+        reason: format!(
+            "{raw:?} is not a literal IP socket address (a hostname is refused: \
+             it must be a loopback IP:port such as 127.0.0.1:22)"
+        ),
+    })?;
+    require_loopback(addr)?;
+    Ok(addr)
+}
+
+fn require_loopback(addr: SocketAddr) -> Result<(), ConfigError> {
+    if addr.ip().is_loopback() {
+        return Ok(());
+    }
+    Err(ConfigError::Invalid {
+        field: "--splice-addr".to_string(),
+        reason: format!(
+            "{addr} is not a loopback address; the Agent splices only to its own \
+             node's sshd (127.0.0.0/8 or ::1) and refuses to start otherwise"
+        ),
+    })
+}
+
 /// The full Agent identity configuration.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -238,5 +331,82 @@ mod tests {
         let r = RenewConfig::default();
         assert!((r.renew_ahead_fraction - 2.0 / 3.0).abs() < 1e-9);
         assert!((r.renew_jitter_fraction - 0.1).abs() < 1e-9);
+    }
+
+    fn gateway_config(splice_addr: SocketAddr) -> GatewayConfig {
+        GatewayConfig {
+            endpoints: vec!["wss://gateway.test:8443".to_string()],
+            server_name: "gateway.test".to_string(),
+            splice_addr,
+            max_concurrent_splices: DEFAULT_MAX_CONCURRENT_SPLICES,
+            connect_timeout: Duration::from_secs(10),
+            backoff_initial: Duration::from_secs(1),
+            backoff_max: Duration::from_secs(30),
+            drain_deadline: Duration::from_secs(30),
+        }
+    }
+
+    #[test]
+    fn splice_target_accepts_only_loopback() {
+        for ok in ["127.0.0.1:22", "127.0.0.53:2222", "[::1]:22"] {
+            let addr = parse_splice_addr(ok).unwrap_or_else(|e| panic!("{ok} must parse: {e}"));
+            assert!(addr.ip().is_loopback());
+            gateway_config(addr).validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn splice_target_refuses_non_loopback_hostname_and_wildcard() {
+        // The SSRF / confused-deputy defence (contract §5). A routable address
+        // would make the Agent a network pivot; the wildcard is not a destination;
+        // a hostname hands the destination to DNS.
+        for bad in [
+            "10.0.0.5:22",
+            "0.0.0.0:22",
+            "192.168.1.10:22",
+            "8.8.8.8:22",
+            "[::]:22",
+            "localhost:22",
+            "sshd.internal:22",
+            "not-an-address",
+        ] {
+            let err = parse_splice_addr(bad)
+                .expect_err("a non-loopback splice target must fail startup closed");
+            assert!(matches!(err, ConfigError::Invalid { .. }), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn gateway_config_validation_fails_closed_on_empty_and_zero_values() {
+        let addr = parse_splice_addr(DEFAULT_SPLICE_ADDR).unwrap();
+
+        let mut no_endpoint = gateway_config(addr);
+        no_endpoint.endpoints.clear();
+        assert!(matches!(
+            no_endpoint.validate(),
+            Err(ConfigError::Missing(_))
+        ));
+
+        let mut no_name = gateway_config(addr);
+        no_name.server_name.clear();
+        assert!(matches!(no_name.validate(), Err(ConfigError::Missing(_))));
+
+        let mut no_splices = gateway_config(addr);
+        no_splices.max_concurrent_splices = 0;
+        assert!(matches!(
+            no_splices.validate(),
+            Err(ConfigError::Invalid { .. })
+        ));
+    }
+
+    #[test]
+    fn gateway_config_validate_rejects_a_non_loopback_splice_addr_built_directly() {
+        // No construction path may bypass the loopback rule, not even one that
+        // skips `parse_splice_addr`.
+        let routable: SocketAddr = "10.0.0.5:22".parse().unwrap();
+        assert!(matches!(
+            gateway_config(routable).validate(),
+            Err(ConfigError::Invalid { .. })
+        ));
     }
 }

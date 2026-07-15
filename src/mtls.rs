@@ -97,13 +97,18 @@ impl std::fmt::Debug for ClientIdentity {
 /// the SAN, and **enforces TLS 1.3** by refusing the TLS-1.2 handshake-signature
 /// path. Wraps rustls' `WebPkiServerVerifier` for the standards-compliant
 /// chain/validity/name checks and fails closed everywhere.
+///
+/// Shared by the tonic CP channel below and the S14 raw-rustls Gateway transport
+/// ([`crate::gateway`]) — one verifier, one posture, verified in one place.
 #[derive(Debug)]
-struct Tls13OnlyPinnedVerifier {
+pub struct Tls13OnlyPinnedVerifier {
     inner: Arc<WebPkiServerVerifier>,
 }
 
 impl Tls13OnlyPinnedVerifier {
-    fn new(trust_anchors_der: &[Vec<u8>]) -> Result<Self, MtlsError> {
+    /// Pin trust to `trust_anchors_der`. An empty anchor set is refused: a verifier
+    /// that trusts nothing would verify nothing.
+    pub fn new(trust_anchors_der: &[Vec<u8>]) -> Result<Self, MtlsError> {
         if trust_anchors_der.is_empty() {
             return Err(MtlsError::TrustAnchor(
                 "no CP trust anchor provided".to_string(),

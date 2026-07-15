@@ -645,15 +645,31 @@ pub fn classify_renew_error(err: &IdentityError) -> RenewalDisposition {
     }
 }
 
-/// Apply the post-renewal minimum-interval floor (F2), never delaying past expiry
-/// (cap the floor at half the remaining TTL). Pure, for unit testing.
+/// Apply the post-renewal minimum-interval floor (F2). Pure, for unit testing.
+///
+/// Normally the floor is capped at half the remaining window so the next renewal
+/// still lands before expiry. But when the freshly-issued cert has **no remaining
+/// window** — the CP handed us one already past `not_after` (a short TTL plus a
+/// large skew backdate, or a CP clock ahead of ours) — that cap collapses to zero
+/// and the loop would renew back-to-back, hammering the CP and burning generations.
+/// There is no window left to race in that state, so apply the **full** anti-storm
+/// floor. The loop treats a zero-remaining renewal as a distinct, loud condition
+/// (see [`RenewAhead::run`]); this helper only guarantees the wait cannot collapse.
 fn floor_after_renew(base: Duration, remaining: Duration) -> Duration {
-    base.max(RENEW_MIN_INTERVAL.min(remaining / 2))
+    let floor = if remaining.is_zero() {
+        RENEW_MIN_INTERVAL
+    } else {
+        RENEW_MIN_INTERVAL.min(remaining / 2)
+    };
+    base.max(floor)
 }
 
 /// Apply ±50% jitter to the retry backoff so a fleet that entered backoff together
 /// (e.g. a CP outage) does not retry in lockstep (F5). `sample` is in `[-1, 1]`.
-fn jittered_backoff(base: Duration, sample: f64) -> Duration {
+///
+/// Shared with the S14 Gateway reconnect ([`crate::gateway`]), which has the same
+/// thundering-herd problem for the same reason.
+pub fn jittered_backoff(base: Duration, sample: f64) -> Duration {
     base.mul_f64(1.0 + 0.5 * sample.clamp(-1.0, 1.0))
 }
 
@@ -749,12 +765,37 @@ impl RenewAhead {
                 random_jitter_sample(),
             );
             // F2: after a renewal, floor the wait so a cert born past its trigger
-            // can't storm the CP, but never delay past expiry.
+            // can't storm the CP; the floor never delays past expiry EXCEPT when
+            // there is no window left at all (see below).
             let delay = if just_renewed {
                 let remaining = current
                     .not_after
                     .duration_since(SystemTime::now())
                     .unwrap_or(Duration::ZERO);
+                if remaining.is_zero() {
+                    // The CP just issued a cert that is ALREADY expired against THIS
+                    // node's clock (persistent skew / a TTL shorter than the skew
+                    // backdate). Deliberate call — retry, NOT terminal (RepairNeeded):
+                    // (1) it is usually transient (NTP recovery, a VM snapshot/clock
+                    // settling), and exiting would turn a recoverable clock blip into a
+                    // re-provision incident; (2) the cause may be the CP's clock, not
+                    // this node's, so a terminal exit would take down healthy agents
+                    // fleet-wide the moment a CP clock jumps ahead. So we hold at the
+                    // FULL anti-storm floor and keep retrying — but LOUDLY (error!, a
+                    // clock/config fault, not a silent transient): burning generations
+                    // corrupts the very counter S12 clone-detection relies on, so a
+                    // bounded ~1/min is the ceiling and it must be visible to page.
+                    tracing::error!(
+                        generation = current.generation,
+                        floor_secs = RENEW_MIN_INTERVAL.as_secs(),
+                        "RENEW-STORM GUARD: the Control Plane issued a certificate with \
+                         no remaining validity against this node's clock (skew, or TTL < \
+                         skew backdate); holding at the full renew floor instead of \
+                         renewing back-to-back — fix the CP/node clock or the cert TTL \
+                         (FR-BOOT-4). The generation counter is a clone-detection signal \
+                         (§8.2); a storm would corrupt it."
+                    );
+                }
                 floor_after_renew(base, remaining)
             } else {
                 base
@@ -1035,8 +1076,8 @@ mod tests {
             floor_after_renew(Duration::ZERO, Duration::from_secs(3600)),
             RENEW_MIN_INTERVAL
         );
-        // Near expiry, the floor is capped at half the remaining TTL so we never
-        // schedule the next renew past not_after.
+        // Near expiry (a real window), the floor is capped at half the remaining TTL
+        // so we still schedule the next renew before not_after.
         assert_eq!(
             floor_after_renew(Duration::ZERO, Duration::from_secs(20)),
             Duration::from_secs(10)
@@ -1045,6 +1086,23 @@ mod tests {
         assert_eq!(
             floor_after_renew(Duration::from_secs(200), Duration::from_secs(3600)),
             Duration::from_secs(200)
+        );
+    }
+
+    #[test]
+    fn floor_after_renew_does_not_collapse_when_no_window_remains() {
+        // F-renewstorm-1: a cert issued ALREADY expired (remaining == 0) must NOT
+        // drop the floor to zero — that is exactly the back-to-back renew storm the
+        // floor exists to prevent. With no window left to race, the full floor holds.
+        assert_eq!(
+            floor_after_renew(Duration::ZERO, Duration::ZERO),
+            RENEW_MIN_INTERVAL,
+            "a zero-remaining cert must be floored to the FULL interval, not zero"
+        );
+        // And a base already beyond the floor is still honoured.
+        assert_eq!(
+            floor_after_renew(Duration::from_secs(120), Duration::ZERO),
+            Duration::from_secs(120)
         );
     }
 
