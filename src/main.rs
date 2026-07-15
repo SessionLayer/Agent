@@ -117,8 +117,9 @@ struct RunArgs {
     /// The Gateway's enrolled name — the SAN its serverAuth certificate must carry.
     #[arg(long, default_value = DEFAULT_GATEWAY_SERVER_NAME)]
     gateway_server_name: String,
-    /// Minimum control channels to hold, to that many diverse Gateways (FR-HA-6).
-    /// Set 1 for single-instance mode.
+    /// Degrade-warn threshold: warn when live control channels drop below this
+    /// (FR-HA-6). Default 1 = single-instance (only the all-lost signal); an HA
+    /// operator sets 2+. Diversity of ≥2 endpoints is enforced independently.
     #[arg(long, default_value_t = DEFAULT_MIN_CONTROL_CHANNELS)]
     min_control_channels: usize,
     /// The node-local address a dial-back is spliced to. MUST be loopback: the

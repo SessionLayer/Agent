@@ -90,17 +90,18 @@ impl Shared {
     }
 }
 
-/// The Agent's Gateway-facing client. Holds **≥2** control channels to
-/// failure-domain-diverse Gateways concurrently (FR-HA-6) — the Agent does **not**
-/// mesh; each channel is an independent dial-out to one Gateway.
+/// The Agent's Gateway-facing client. Holds one control channel per configured
+/// endpoint concurrently — for HA, ≥2 to failure-domain-diverse Gateways (FR-HA-6);
+/// for single-instance, exactly one. The Agent does **not** mesh; each channel is an
+/// independent dial-out to one Gateway.
 pub struct GatewayClient {
     shared: Arc<Shared>,
 }
 
 impl GatewayClient {
-    /// Build the client, validating the configuration (loopback splice target, ≥2
-    /// diverse endpoints, caps) **before** anything is dialled — fail closed at
-    /// startup.
+    /// Build the client, validating the configuration (loopback splice target,
+    /// endpoint diversity when multi-homed, caps) **before** anything is dialled —
+    /// fail closed at startup.
     pub fn new(
         config: GatewayConfig,
         renew: RenewHandle,
@@ -496,12 +497,14 @@ impl ControlChannel {
     }
 }
 
-/// Tracks fleet-wide reachability for the all-Gateways-lost degrade (FR-HA-6). One
-/// is held for the lifetime of a registered connection; the count is the number of
-/// currently-registered control channels. A 0→1 transition means the node is
-/// reachable again; a 1→0 transition means it is unreachable and callers should
-/// degrade to out-of-band tooling (there is deliberately no bespoke fallback — the
-/// value of ≥2 diverse channels is that all-lost is rare).
+/// Tracks fleet-wide reachability for the FR-HA-6 degrade. One is held for the
+/// lifetime of a registered connection; the count is the number of currently-
+/// registered control channels. **0 live channels is the hard degrade**: the node
+/// is unreachable and callers must fall back to out-of-band tooling (there is
+/// deliberately no bespoke fallback — the value of diverse channels is that all-lost
+/// is rare). Dropping **below `min_control_channels`** (but still >0) warns that the
+/// operator's requested redundancy is lost — for single-instance (min 1) the only
+/// signal is the all-lost one, which is correct.
 struct Reachability<'a> {
     shared: &'a Shared,
 }
@@ -513,6 +516,12 @@ impl<'a> Reachability<'a> {
             tracing::info!(
                 endpoint = %endpoint.url,
                 "node is reachable: a Gateway control channel is up"
+            );
+        }
+        if now == shared.config.min_control_channels && shared.config.min_control_channels > 1 {
+            tracing::info!(
+                connected = now,
+                "control-channel redundancy restored to the configured minimum"
             );
         }
         tracing::debug!(
@@ -533,8 +542,14 @@ impl Drop for Reachability<'_> {
                  Degrade to out-of-band tooling (FR-HA-6); new sessions get the §7.1 \
                  'node offline / unreachable' outcome until a channel recovers"
             );
-        } else {
+        } else if now < self.shared.config.min_control_channels {
             tracing::warn!(
+                connected = now,
+                min = self.shared.config.min_control_channels,
+                "a control channel dropped below the configured minimum redundancy"
+            );
+        } else {
+            tracing::debug!(
                 connected = now,
                 of = self.shared.total_channels,
                 "a control channel dropped"

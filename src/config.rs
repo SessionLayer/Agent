@@ -26,9 +26,13 @@ pub const DEFAULT_CP_SERVER_NAME: &str = "controlplane";
 pub const DEFAULT_SPLICE_ADDR: &str = "127.0.0.1:22";
 /// Default cap on simultaneous spliced sessions this Agent will serve.
 pub const DEFAULT_MAX_CONCURRENT_SPLICES: usize = 32;
-/// Default number of control channels an Agent must hold — **2**, to
-/// failure-domain-diverse Gateways (FR-HA-6). Set to 1 for single-instance mode.
-pub const DEFAULT_MIN_CONTROL_CHANNELS: usize = 2;
+/// Default minimum control channels — **1**. Single-instance is the platform's
+/// default mode (Design §10.1) and must stay zero-friction: an agent-model node
+/// connects to exactly one Gateway. An HA operator raises this to 2+, which then
+/// also becomes the runtime degrade-warn threshold (live channels below it warns;
+/// 0 live is the hard "node unreachable"). Diversity is enforced independently
+/// whenever ≥2 endpoints are configured, regardless of this value.
+pub const DEFAULT_MIN_CONTROL_CHANNELS: usize = 1;
 
 /// A configuration error (missing/invalid material). Fails startup closed.
 #[derive(Debug, thiserror::Error)]
@@ -262,10 +266,12 @@ impl GatewayConfig {
             });
         }
 
-        // HA (≥2 channels) is only real availability if the channels span ≥2 failure
-        // domains — otherwise one rack/AZ outage takes them all. Single-instance
-        // (min == 1) is exempt (there is nothing to diversify).
-        if self.min_control_channels >= 2 {
+        // Multi-homing is only real availability if the channels span ≥2 failure
+        // domains — otherwise one rack/AZ outage takes them all. Enforced whenever
+        // ≥2 endpoints are configured (diversity is meaningful the moment you are
+        // multi-homed), independent of the min-channels degrade threshold.
+        // Single-instance (one endpoint) has nothing to diversify.
+        if self.endpoints.len() >= 2 {
             let distinct = self.distinct_failure_domains();
             if distinct < 2 {
                 return Err(ConfigError::Invalid {
@@ -457,11 +463,12 @@ mod tests {
     }
 
     #[test]
-    fn ha_requires_at_least_two_diverse_failure_domains() {
+    fn two_or_more_endpoints_require_at_least_two_diverse_failure_domains() {
         let addr = parse_splice_addr(DEFAULT_SPLICE_ADDR).unwrap();
 
         // Two channels but ONE failure domain: not diverse — one AZ outage takes
-        // both, so it is not HA. Fail closed.
+        // both, so it is not HA. Enforced whenever multi-homed, regardless of the
+        // min-channels threshold. Fail closed.
         let mut same_domain = gateway_config(addr);
         same_domain.endpoints = vec![
             endpoint("wss://gw-a.test:8443", "az-a"),
@@ -469,14 +476,6 @@ mod tests {
         ];
         assert!(matches!(
             same_domain.validate(),
-            Err(ConfigError::Invalid { .. })
-        ));
-
-        // Fewer endpoints than min_control_channels.
-        let mut too_few = gateway_config(addr);
-        too_few.endpoints = vec![endpoint("wss://gw-a.test:8443", "az-a")];
-        assert!(matches!(
-            too_few.validate(),
             Err(ConfigError::Invalid { .. })
         ));
 
@@ -490,13 +489,28 @@ mod tests {
     }
 
     #[test]
-    fn single_instance_mode_allows_one_channel() {
-        // min_control_channels == 1 opts out of the diversity requirement (there is
-        // nothing to diversify) — S14's single-Gateway posture stays valid.
+    fn fewer_endpoints_than_the_min_channel_threshold_is_refused() {
+        // An HA operator that asked for 2 channels but configured 1 is refused —
+        // they explicitly wanted redundancy they do not have.
+        let addr = parse_splice_addr(DEFAULT_SPLICE_ADDR).unwrap();
+        let mut too_few = gateway_config(addr);
+        too_few.endpoints = vec![endpoint("wss://gw-a.test:8443", "az-a")];
+        too_few.min_control_channels = 2;
+        assert!(matches!(
+            too_few.validate(),
+            Err(ConfigError::Invalid { .. })
+        ));
+    }
+
+    #[test]
+    fn single_instance_is_the_default_and_allows_one_channel() {
+        // Default min == 1: one endpoint is valid with no diversity requirement —
+        // single-instance stays zero-friction (Design §10.1).
         let addr = parse_splice_addr(DEFAULT_SPLICE_ADDR).unwrap();
         let mut single = gateway_config(addr);
         single.endpoints = vec![endpoint("wss://gw-a.test:8443", "az-a")];
-        single.min_control_channels = 1;
+        assert_eq!(single.min_control_channels, DEFAULT_MIN_CONTROL_CHANNELS);
+        assert_eq!(DEFAULT_MIN_CONTROL_CHANNELS, 1);
         single.validate().unwrap();
     }
 

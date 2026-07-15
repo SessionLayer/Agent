@@ -100,8 +100,8 @@ stays supported.
 | flag | default | notes |
 |------|---------|-------|
 | `--gateway-endpoint` (repeatable) | none | `wss://` only; `ws://` is refused. Omit ⇒ identity-only. **Pass it ≥2 times** for HA (S15): the Agent holds one control channel per endpoint concurrently and does **not** mesh. |
-| `--gateway-failure-domain` (repeatable) | endpoint host | failure-domain label (rack / AZ) for the corresponding `--gateway-endpoint`, **zipped positionally**. Provide one per endpoint, or none (each then defaults to its host). ≥2 channels must span ≥2 domains. |
-| `--min-control-channels` | 2 | the Agent needs at least this many diverse channels (FR-HA-6). **Set `1` for single-instance mode** (one Gateway, no diversity requirement). |
+| `--gateway-failure-domain` (repeatable) | endpoint host | failure-domain label (rack / AZ) for the corresponding `--gateway-endpoint`, **zipped positionally**. Provide one per endpoint, or none (each then defaults to its host). Whenever ≥2 endpoints are configured they must span ≥2 domains. |
+| `--min-control-channels` | 1 | degrade-warn threshold: the Agent warns when live channels drop below this. **Default 1 = single-instance** (only the all-lost signal). An HA operator sets `2+`; then 2→1 warns and 1→0 is the hard "node unreachable". |
 | `--gateway-server-name` | `gateway` | the Gateway's **enrolled name**; the dNSName SAN its serverAuth cert must carry. Verified against the internal CA — dial an address, verify a name. Set to the real enrolled name in prod. |
 | `--splice-addr` | `127.0.0.1:22` | the node's local sshd. **Loopback-validated at startup; the Agent refuses to boot otherwise** (see below). |
 | `--max-concurrent-splices` | 32 | a dial-back beyond the cap is `REFUSED`, never queued. Shared across all control channels. |
@@ -115,13 +115,15 @@ holds a control channel to each simultaneously. It does **not** mesh — the cha
 are independent dial-outs. This is what makes a node reachable when one Gateway (or a
 whole rack/AZ) dies.
 
-- **Startup validation, fail-closed.** With `--min-control-channels 2` (the default)
-  the Agent refuses to boot unless it has ≥2 endpoints spanning ≥2 distinct failure
-  domains (a duplicate endpoint, or two channels in one domain, is refused — it is
-  not real HA). Two Gateways on the *same host* are one domain by default; label them
-  or use different hosts.
-- **Single-instance mode.** Pass `--min-control-channels 1` to run against one
-  Gateway (the S14 posture). No diversity is required.
+- **Startup validation, fail-closed.** Whenever ≥2 `--gateway-endpoint`s are given,
+  the Agent refuses to boot unless they span ≥2 distinct failure domains (a duplicate
+  endpoint, or two channels in one domain, is refused — it is not real HA). Two
+  Gateways on the *same host* are one domain by default; label them or use different
+  hosts. This diversity check is independent of `--min-control-channels`.
+- **Single-instance mode (default).** One `--gateway-endpoint` and the default
+  `--min-control-channels 1`: the Agent runs against one Gateway with no diversity
+  requirement (the S14 posture). An HA operator passes ≥2 endpoints and sets
+  `--min-control-channels 2` so a drop to one channel warns.
 - **Per-channel dial-back affinity.** A `DIAL_BACK_REQUEST` arriving on the channel
   to gw-A may **only** dial back to gw-A. In the HA routing model the node's *owning*
   Gateway signals over its own channel, so the dial-back endpoint always equals the
