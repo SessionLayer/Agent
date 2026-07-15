@@ -87,6 +87,10 @@ pub struct GwOptions {
     pub ping: bool,
     /// Refuse any DIAL_BACK_AUTH whose token is not this one.
     pub expect_token: Option<String>,
+    /// The dNSName SAN this Gateway's serverAuth leaf carries (its enrolled name).
+    /// Defaults to `GATEWAY_SERVER_NAME`; set distinct values per instance to
+    /// exercise the real diverse-gateway case where SANs differ per gateway.
+    pub server_name: Option<String>,
 }
 
 impl Default for GwOptions {
@@ -98,6 +102,7 @@ impl Default for GwOptions {
             bogus_selected: None,
             ping: false,
             expect_token: None,
+            server_name: None,
         }
     }
 }
@@ -248,6 +253,7 @@ impl DialBackConn {
 /// A running test Gateway. Aborts its listener on drop.
 pub struct TestGateway {
     addr: SocketAddr,
+    server_name: String,
     opts: GwOptions,
     events: mpsc::UnboundedReceiver<GwEvent>,
     control: Arc<Mutex<Option<mpsc::Sender<Cmd>>>>,
@@ -277,8 +283,13 @@ impl TestGateway {
         sessionlayer_agent::tls::install_ring_provider();
 
         // The Gateway's serverAuth leaf comes from the SAME internal CA that issued
-        // the Agent's identity — that CA is the Agent's only trust anchor here.
-        let (cert_pem, key_pem) = cp.issue_server_leaf(&[GATEWAY_SERVER_NAME, "localhost"]);
+        // the Agent's identity — that CA is the Agent's only trust anchor here. The
+        // SAN is this instance's enrolled name (distinct per gateway in HA).
+        let server_name = opts
+            .server_name
+            .clone()
+            .unwrap_or_else(|| GATEWAY_SERVER_NAME.to_string());
+        let (cert_pem, key_pem) = cp.issue_server_leaf(&[server_name.as_str(), "localhost"]);
         let certs: Vec<_> = pem::parse_many(&cert_pem)
             .unwrap()
             .into_iter()
@@ -400,6 +411,7 @@ impl TestGateway {
 
         TestGateway {
             addr,
+            server_name,
             opts,
             events,
             control,
@@ -416,7 +428,7 @@ impl TestGateway {
     }
 
     pub fn server_name(&self) -> &str {
-        GATEWAY_SERVER_NAME
+        &self.server_name
     }
 
     /// How many control channels have completed the preface (a reconnect adds one).

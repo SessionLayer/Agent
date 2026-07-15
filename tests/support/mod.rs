@@ -86,6 +86,21 @@ impl TestCa {
     }
 }
 
+/// The subject Common Name of a PKCS#10 CSR (DER), for the CP's node_name check.
+fn csr_common_name(csr_der: &[u8]) -> Option<String> {
+    let typed = rustls::pki_types::CertificateSigningRequestDer::from(csr_der.to_vec());
+    let csr = rcgen::CertificateSigningRequestParams::from_der(&typed).ok()?;
+    match csr
+        .params
+        .distinguished_name
+        .get(&rcgen::DnType::CommonName)
+    {
+        Some(rcgen::DnValue::Utf8String(s)) => Some(s.clone()),
+        Some(rcgen::DnValue::PrintableString(s)) => Some(s.to_string()),
+        _ => None,
+    }
+}
+
 /// Per-agent registry record.
 struct AgentRecord {
     node_id: String,
@@ -129,6 +144,15 @@ impl AgentIdentity for MockSvc {
         let proof = req
             .proof
             .ok_or_else(|| Status::unauthenticated("no join proof"))?;
+
+        // Match the REAL CP: the CSR subject Common Name must equal node_name
+        // (AgentEnrollmentService). Validating this here — not just the SAN — is what
+        // stops the double from masking a SAN-only CSR (F-enroll-cn-1).
+        if csr_common_name(&csr).as_deref() != Some(node_name.as_str()) {
+            return Err(Status::invalid_argument(
+                "CSR subject CN does not match node_name",
+            ));
+        }
 
         let mut st = self.0.lock().unwrap();
 
@@ -244,6 +268,15 @@ impl AgentIdentity for MockSvc {
 
         if locked || st.locked_nodes.contains(&node_name) {
             return Err(Status::permission_denied("identity locked"));
+        }
+
+        // The real CP validates csr.commonName() == node_name on the RENEW path too
+        // (AgentRenewalService), not just enroll — so the renew CSR must carry the CN
+        // (F-enroll-cn-1). Enforce it here so a renew-CSR regression is caught.
+        if csr_common_name(&req.pkcs10_csr).as_deref() != Some(node_name.as_str()) {
+            return Err(Status::invalid_argument(
+                "CSR subject CN does not match identity",
+            ));
         }
 
         // §8.2 clone detection: a declared generation that does not match the

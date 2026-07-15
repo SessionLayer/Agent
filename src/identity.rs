@@ -213,12 +213,20 @@ impl std::fmt::Debug for KeypairCsr {
     }
 }
 
-/// Generate a fresh ECDSA P-256 keypair and a PKCS#10 CSR whose subject
-/// alternative name is `node_name`. The private key stays local; only the CSR
-/// (public key + proof of possession) is ever sent (D2/§15).
+/// Generate a fresh ECDSA P-256 keypair and a PKCS#10 CSR carrying `node_name` as
+/// **both** the subject Common Name and a dNSName SAN. The private key stays local;
+/// only the CSR (public key + proof of possession) is ever sent (D2/§15).
+///
+/// The CN is load-bearing: the CP validates `csr.commonName() == node_name` at
+/// enrollment (as it does for the Gateway), so a CSR with only a SAN is rejected
+/// `InvalidArgument`. This matches the Gateway's `generate_keypair_and_csr` — the
+/// machinery the Agent was ported from.
 pub fn generate_keypair_and_csr(node_name: &str) -> Result<KeypairCsr, IdentityError> {
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
-    let params = rcgen::CertificateParams::new(vec![node_name.to_string()])?;
+    let mut params = rcgen::CertificateParams::new(vec![node_name.to_string()])?;
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, node_name);
     let csr = params.serialize_request(&key)?;
     Ok(KeypairCsr {
         key_pem: Zeroizing::new(key.serialize_pem()),
@@ -883,6 +891,24 @@ mod tests {
                 .windows(16)
                 .any(|w| w == &kc.key_pem.as_bytes()[..16]),
             "no fragment of the private key may appear in the CSR"
+        );
+    }
+
+    #[test]
+    fn csr_carries_node_name_as_common_name() {
+        // The CP validates csr.commonName() == node_name at enrollment (as it does
+        // for the Gateway); a SAN-only CSR is rejected InvalidArgument. See
+        // F-enroll-cn-1 — the Agent port had dropped the CN the Gateway sets.
+        let kc = generate_keypair_and_csr("web-01").unwrap();
+        let typed = rustls::pki_types::CertificateSigningRequestDer::from(kc.csr_der.clone());
+        let parsed = rcgen::CertificateSigningRequestParams::from_der(&typed).unwrap();
+        let cn = parsed
+            .params
+            .distinguished_name
+            .get(&rcgen::DnType::CommonName);
+        assert!(
+            matches!(cn, Some(rcgen::DnValue::Utf8String(s)) if s == "web-01"),
+            "CSR subject CN must equal node_name, got {cn:?}"
         );
     }
 

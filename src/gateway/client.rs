@@ -130,7 +130,6 @@ impl GatewayClient {
         tracing::info!(
             channels = shared.total_channels,
             failure_domains = shared.config.distinct_failure_domains(),
-            server_name = %shared.config.server_name,
             splice_addr = %shared.config.splice_addr,
             max_concurrent_splices = shared.config.max_concurrent_splices,
             "gateway control channels starting (dial-out to diverse Gateways; no mesh)"
@@ -213,7 +212,7 @@ impl ControlChannel {
     ) -> Ended {
         let mut ws = match transport::connect(
             &self.endpoint.url,
-            &self.shared.config.server_name,
+            &self.endpoint.server_name,
             CONTROL_PATH,
             cred,
             self.shared.config.connect_timeout,

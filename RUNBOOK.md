@@ -102,7 +102,7 @@ stays supported.
 | `--gateway-endpoint` (repeatable) | none | `wss://` only; `ws://` is refused. Omit ⇒ identity-only. **Pass it ≥2 times** for HA (S15): the Agent holds one control channel per endpoint concurrently and does **not** mesh. |
 | `--gateway-failure-domain` (repeatable) | endpoint host | failure-domain label (rack / AZ) for the corresponding `--gateway-endpoint`, **zipped positionally**. Provide one per endpoint, or none (each then defaults to its host). Whenever ≥2 endpoints are configured they must span ≥2 domains. |
 | `--min-control-channels` | 1 | degrade-warn threshold: the Agent warns when live channels drop below this. **Default 1 = single-instance** (only the all-lost signal). An HA operator sets `2+`; then 2→1 warns and 1→0 is the hard "node unreachable". |
-| `--gateway-server-name` | `gateway` | the Gateway's **enrolled name**; the dNSName SAN its serverAuth cert must carry. Verified against the internal CA — dial an address, verify a name. Set to the real enrolled name in prod. |
+| `--gateway-server-name` (repeatable) | `gateway` | the enrolled name whose serverAuth SAN the Agent verifies for the corresponding `--gateway-endpoint`, **zipped positionally**. Distinct real Gateways carry **distinct** SANs, so give one per endpoint; or exactly one to apply to all; or none to default each to `gateway`. Verified against the internal CA — dial an address, verify a name. |
 | `--splice-addr` | `127.0.0.1:22` | the node's local sshd. **Loopback-validated at startup; the Agent refuses to boot otherwise** (see below). |
 | `--max-concurrent-splices` | 32 | a dial-back beyond the cap is `REFUSED`, never queued. Shared across all control channels. |
 | `--drain-deadline-secs` | 30 | how long live splices may finish after the Agent stops taking new work. |
@@ -188,8 +188,10 @@ handle it exactly as the S12 clone/repair incident above.
 ## Symptom: the control channel reconnects in a loop (node flaps offline)
 Each reconnect re-runs the **full** TLS + mTLS + preface — there is no resumption.
 Common causes: (a) the Gateway's serverAuth cert does not chain to the CA the Agent
-holds, or its SAN ≠ `--gateway-server-name` (TLS fails closed — verify properly or
-not at all); (b) a `VERSION_REJECT` (no common protocol version — the Agent will
+holds, or its SAN ≠ that endpoint's `--gateway-server-name` (TLS fails closed — verify
+properly or not at all; with ≥2 Gateways make sure each endpoint's server name is the
+one that Gateway is enrolled under); (b) a `VERSION_REJECT` (no common protocol
+version — the Agent will
 **never** downgrade, FR-HA-9); (c) a `HELLO_ACK` proposing a heartbeat outside
 1–300s or `max_frame_bytes` outside 4 KiB–1 MiB (refused, fail closed). The log
 line names which. A node whose Agent is not connected is simply **offline** (§7.1),
