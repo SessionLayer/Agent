@@ -33,6 +33,14 @@ RELS=(
 SRC_ROOT="../ControlPlane-API/contracts/proto"
 DST_ROOT="proto"
 
+# Extra vendored files that live outside the proto tree, as "SRC|DST" pairs. The
+# wire conformance vectors (S15 Part H) are golden bytes generated from the canonical
+# codec; the Agent runs them against its OWN codec (tests/wire_conformance.rs) so
+# framing/registry drift fails in the Agent's CI. Kept in sync like the protos.
+EXTRAS=(
+  "../ControlPlane-API/contracts/wire/conformance/frames.json|tests/conformance/frames.json"
+)
+
 mode="${1:-sync}"
 
 if [ ! -d "$SRC_ROOT" ]; then
@@ -43,13 +51,14 @@ if [ ! -d "$SRC_ROOT" ]; then
 fi
 
 rc=0
-for REL in "${RELS[@]}"; do
-  SRC="${SRC_ROOT}/${REL}"
-  DST="${DST_ROOT}/${REL}"
+
+sync_one() {
+  # $1 = canonical source path, $2 = vendored destination path.
+  local SRC="$1" DST="$2"
   if [ ! -f "$SRC" ]; then
     echo "DRIFT: canonical ${SRC} is missing" >&2
     rc=1
-    continue
+    return
   fi
   case "$mode" in
     --check)
@@ -72,6 +81,13 @@ for REL in "${RELS[@]}"; do
       exit 2
       ;;
   esac
+}
+
+for REL in "${RELS[@]}"; do
+  sync_one "${SRC_ROOT}/${REL}" "${DST_ROOT}/${REL}"
+done
+for PAIR in "${EXTRAS[@]}"; do
+  sync_one "${PAIR%%|*}" "${PAIR##*|}"
 done
 
 if [ "$mode" = "sync" ]; then
