@@ -25,6 +25,14 @@ pub use client::GatewayClient;
 
 use std::time::Duration;
 
+/// The default failure-domain label for a `wss://` endpoint: its host (§F). Two
+/// Gateways on the same host share a failure domain, so this is the fail-closed
+/// default when the operator gives no explicit label. `None` if the endpoint is not
+/// a valid `wss://` URL with a host.
+pub fn default_failure_domain(endpoint: &str) -> Option<String> {
+    transport::host_of(endpoint)
+}
+
 /// A failure on the Gateway plane. Every variant is a refusal: there is no path
 /// that falls back to plaintext, to an unverified peer, or to an unnegotiated
 /// protocol version.

@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use sessionlayer_agent::config::{parse_splice_addr, GatewayConfig};
+use sessionlayer_agent::config::{parse_splice_addr, GatewayConfig, GatewayEndpoint};
 use sessionlayer_agent::gateway::GatewayClient;
 use sessionlayer_agent::identity::{
     self, IdentityStore, RenewAhead, RenewAheadConfig, RenewHandle, RenewOutcome,
@@ -70,12 +70,18 @@ fn spawn_echo_listener() -> (SocketAddr, Arc<AtomicUsize>) {
     (addr, accepted)
 }
 
+/// A single-Gateway config (S14 posture): `min_control_channels = 1` opts out of
+/// the HA diversity requirement. The Part F tests below build a multi-channel one.
 fn gateway_config(gw: &TestGateway, splice_addr: SocketAddr) -> GatewayConfig {
     GatewayConfig {
-        endpoints: vec![gw.endpoint()],
+        endpoints: vec![GatewayEndpoint {
+            url: gw.endpoint(),
+            failure_domain: "az-a".to_string(),
+        }],
         server_name: GATEWAY_SERVER_NAME.to_string(),
         splice_addr,
         max_concurrent_splices: 32,
+        min_control_channels: 1,
         connect_timeout: CT,
         backoff_initial: Duration::from_millis(50),
         backoff_max: Duration::from_millis(200),
@@ -495,6 +501,129 @@ async fn a_hostile_dial_back_endpoint_cannot_be_used_as_a_pivot() {
         0,
         "an unconfigured dial-back endpoint must never be connected to"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Part F — ≥2 failure-domain-diverse control channels (no mesh) + degrade
+// ---------------------------------------------------------------------------
+
+/// A config holding one channel per Gateway, each in a distinct failure domain.
+fn ha_gateway_config(gws: &[&TestGateway], splice_addr: SocketAddr) -> GatewayConfig {
+    let endpoints = gws
+        .iter()
+        .enumerate()
+        .map(|(i, gw)| GatewayEndpoint {
+            url: gw.endpoint(),
+            failure_domain: format!("az-{i}"),
+        })
+        .collect();
+    GatewayConfig {
+        endpoints,
+        server_name: GATEWAY_SERVER_NAME.to_string(),
+        splice_addr,
+        max_concurrent_splices: 32,
+        min_control_channels: 2,
+        connect_timeout: CT,
+        backoff_initial: Duration::from_millis(50),
+        backoff_max: Duration::from_millis(200),
+        drain_deadline: Duration::from_secs(10),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_holds_two_diverse_channels_and_survives_losing_one_gateway() {
+    // NFR-1 / FR-HA-6: the Agent dials OUT to two failure-domain-diverse Gateways
+    // and holds a control channel to each (it does not mesh). Losing one Gateway
+    // must not disrupt sessions routed through the other.
+    let cp = MockCp::start().await;
+    let token = "SLDB1.opaque";
+    let mut gw_a = TestGateway::start_with(
+        &cp,
+        GwOptions {
+            expect_token: Some(token.to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut gw_b = TestGateway::start_with(
+        &cp,
+        GwOptions {
+            expect_token: Some(token.to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let renew = enrolled_agent(&cp, dir.path(), NODE).await;
+    let (splice_addr, _) = spawn_echo_listener();
+
+    let (_stop, _task) = spawn_client(ha_gateway_config(&[&gw_a, &gw_b], splice_addr), &renew);
+
+    // The Agent registers on BOTH Gateways concurrently.
+    gw_a.await_registration().await;
+    gw_b.await_registration().await;
+
+    // Baseline: a session routed through gw-B works.
+    gw_b.send_dial_back(gw_b.dial_back_request(NODE, token))
+        .await;
+    let mut s1 = gw_b.await_splice().await;
+    assert!(gw_b.await_result().await.accepted);
+    s1.write(b"one").await;
+    assert_eq!(s1.read_exactly(3).await, b"one");
+
+    // gw-A dies (its control channel drops). The gw-B channel is independent.
+    gw_a.drop_control().await;
+
+    // A NEW session through gw-B still works — losing gw-A stranded nothing.
+    let mut req = gw_b.dial_back_request(NODE, token);
+    req.request_id = "req-after-loss".to_string();
+    gw_b.send_dial_back(req).await;
+    let mut s2 = gw_b.await_splice().await;
+    let r = gw_b.await_result().await;
+    assert!(
+        r.accepted,
+        "gw-B must keep serving after gw-A is lost (NFR-1)"
+    );
+    assert_eq!(r.request_id, "req-after-loss");
+    s2.write(b"still-here").await;
+    assert_eq!(s2.read_exactly(10).await, b"still-here");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dial_back_is_refused_unless_its_endpoint_is_the_arriving_channels_gateway() {
+    // Per-channel affinity (FR-HA-6), tighter than F-connect-1: a request arriving on
+    // gw-A's channel may only dial back to gw-A. gw-B here is a *configured* Gateway
+    // (so F-connect-1's endpoint_is_configured would pass), but it is not THIS
+    // channel's Gateway — so affinity refuses it before anything is dialled. This
+    // stops a compromised gw-A from tasking the Agent to open a connection to gw-B.
+    let cp = MockCp::start().await;
+    let mut gw_a = TestGateway::start(&cp).await;
+    let mut gw_b = TestGateway::start(&cp).await;
+    let dir = tempfile::tempdir().unwrap();
+    let renew = enrolled_agent(&cp, dir.path(), NODE).await;
+    let (splice_addr, splice_hits) = spawn_echo_listener();
+
+    let (_stop, _task) = spawn_client(ha_gateway_config(&[&gw_a, &gw_b], splice_addr), &renew);
+    gw_a.await_registration().await;
+    gw_b.await_registration().await;
+
+    // gw-A tasks the Agent with a dial-back whose endpoint is gw-B (a configured, but
+    // wrong-for-this-channel, Gateway).
+    let mut req = gw_a.dial_back_request(NODE, "t");
+    req.dial_back_endpoint = gw_b.endpoint();
+    gw_a.send_dial_back(req).await;
+
+    let result = gw_a.await_result().await;
+    assert!(!result.accepted);
+    assert_eq!(
+        result.error,
+        DialBackErrorCode::Refused as i32,
+        "a dial-back naming a different Gateway than the arriving channel must be refused"
+    );
+    // Nothing was dialled: not gw-B, not the node.
+    assert_eq!(gw_a.dialback_attempts(), 0);
+    assert_eq!(gw_b.dialback_attempts(), 0);
+    assert_eq!(splice_hits.load(Ordering::SeqCst), 0);
 }
 
 // ---------------------------------------------------------------------------

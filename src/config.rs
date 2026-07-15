@@ -26,6 +26,9 @@ pub const DEFAULT_CP_SERVER_NAME: &str = "controlplane";
 pub const DEFAULT_SPLICE_ADDR: &str = "127.0.0.1:22";
 /// Default cap on simultaneous spliced sessions this Agent will serve.
 pub const DEFAULT_MAX_CONCURRENT_SPLICES: usize = 32;
+/// Default number of control channels an Agent must hold — **2**, to
+/// failure-domain-diverse Gateways (FR-HA-6). Set to 1 for single-instance mode.
+pub const DEFAULT_MIN_CONTROL_CHANNELS: usize = 2;
 
 /// A configuration error (missing/invalid material). Fails startup closed.
 #[derive(Debug, thiserror::Error)]
@@ -159,14 +162,26 @@ impl Default for RenewConfig {
     }
 }
 
-/// The Agent's outbound-connectivity configuration (S14): the Gateway control
-/// channel, and the local splice target the dial-back is joined to.
+/// One Gateway control-channel target: where to dial, and which **failure domain**
+/// it lives in. The Agent holds a channel to each and requires ≥2 distinct domains
+/// (FR-HA-6) so losing one domain never strands the node.
+#[derive(Debug, Clone)]
+pub struct GatewayEndpoint {
+    /// The `wss://host:port` address to dial out to.
+    pub url: String,
+    /// An operator-assigned failure-domain label (rack / AZ / region). Two channels
+    /// in the same domain are not diverse; the default is the endpoint's **host**,
+    /// so two Gateways on one host are correctly treated as one domain (fail-closed).
+    pub failure_domain: String,
+}
+
+/// The Agent's outbound-connectivity configuration (S14; HA channels S15): the
+/// Gateway control channels, and the local splice target the dial-back is joined to.
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
-    /// Gateway `wss://host:port` endpoints to dial **out** to. Repeatable so HA
-    /// (≥2 failure-domain-diverse Gateways, FR-HA-6) slots in; this session drives
-    /// exactly one channel.
-    pub endpoints: Vec<String>,
+    /// Gateway endpoints to dial **out** to (FR-HA-6). The Agent holds one control
+    /// channel per endpoint concurrently — it does **not** mesh.
+    pub endpoints: Vec<GatewayEndpoint>,
     /// The Gateway's enrolled name — the dNSName SAN its **serverAuth** leaf must
     /// carry. Dial an address, verify a name: the address never authorises anything
     /// (no TOFU on this path either).
@@ -174,8 +189,13 @@ pub struct GatewayConfig {
     /// The node-local address the dial-back is spliced to. **Loopback-validated at
     /// startup** ([`parse_splice_addr`]); nothing on the wire can change it.
     pub splice_addr: SocketAddr,
-    /// Cap on simultaneous spliced sessions (a dial-back beyond it is REFUSED).
+    /// Cap on simultaneous spliced sessions (a dial-back beyond it is REFUSED),
+    /// shared across all control channels.
     pub max_concurrent_splices: usize,
+    /// Minimum control channels this Agent must be configured with, to that many
+    /// failure-domain-diverse Gateways (FR-HA-6). Default 2; set 1 for
+    /// single-instance mode.
+    pub min_control_channels: usize,
     /// Bound on TCP connect + TLS handshake + the connection preface.
     pub connect_timeout: Duration,
     /// First reconnect backoff step; doubles up to [`Self::backoff_max`], ±50%
@@ -200,12 +220,81 @@ impl GatewayConfig {
                 reason: "must be at least 1".to_string(),
             });
         }
+        if self.min_control_channels == 0 {
+            return Err(ConfigError::Invalid {
+                field: "--min-control-channels".to_string(),
+                reason: "must be at least 1".to_string(),
+            });
+        }
         if self.server_name.is_empty() {
             return Err(ConfigError::Missing("--gateway-server-name".to_string()));
         }
+
+        // Two Gateways at the same authority are not two channels; a duplicate is a
+        // config error, not silent single-homing dressed up as HA.
+        let mut authorities: Vec<String> = Vec::with_capacity(self.endpoints.len());
+        for ep in &self.endpoints {
+            let auth = crate::gateway::transport::authority_of(&ep.url).map_err(|e| {
+                ConfigError::Invalid {
+                    field: "--gateway-endpoint".to_string(),
+                    reason: e.to_string(),
+                }
+            })?;
+            if authorities.contains(&auth) {
+                return Err(ConfigError::Invalid {
+                    field: "--gateway-endpoint".to_string(),
+                    reason: format!("{} is listed more than once", ep.url),
+                });
+            }
+            authorities.push(auth);
+        }
+
+        if self.endpoints.len() < self.min_control_channels {
+            return Err(ConfigError::Invalid {
+                field: "--gateway-endpoint".to_string(),
+                reason: format!(
+                    "{} endpoint(s) configured but --min-control-channels is {}; \
+                     the Agent needs at least that many diverse Gateways (FR-HA-6). \
+                     Use --min-control-channels 1 for single-instance mode",
+                    self.endpoints.len(),
+                    self.min_control_channels
+                ),
+            });
+        }
+
+        // HA (≥2 channels) is only real availability if the channels span ≥2 failure
+        // domains — otherwise one rack/AZ outage takes them all. Single-instance
+        // (min == 1) is exempt (there is nothing to diversify).
+        if self.min_control_channels >= 2 {
+            let distinct = self.distinct_failure_domains();
+            if distinct < 2 {
+                return Err(ConfigError::Invalid {
+                    field: "--gateway-failure-domain".to_string(),
+                    reason: format!(
+                        "the {} control channels span only {distinct} failure domain(s); \
+                         ≥2 diverse domains are required (FR-HA-6) so losing one domain \
+                         does not strand the node. Label endpoints on distinct hosts, or \
+                         pass --gateway-failure-domain",
+                        self.endpoints.len()
+                    ),
+                });
+            }
+        }
+
         // Defence in depth: the splice address is loopback-validated where it is
         // parsed, but re-assert it here so no construction path can bypass it.
         require_loopback(self.splice_addr)
+    }
+
+    /// The number of distinct failure domains across the configured endpoints.
+    pub fn distinct_failure_domains(&self) -> usize {
+        let mut seen: Vec<&str> = Vec::new();
+        for ep in &self.endpoints {
+            if !seen.contains(&ep.failure_domain.as_str()) {
+                seen.push(&ep.failure_domain);
+            }
+        }
+        seen.len()
     }
 }
 
@@ -333,12 +422,24 @@ mod tests {
         assert!((r.renew_jitter_fraction - 0.1).abs() < 1e-9);
     }
 
+    fn endpoint(url: &str, domain: &str) -> GatewayEndpoint {
+        GatewayEndpoint {
+            url: url.to_string(),
+            failure_domain: domain.to_string(),
+        }
+    }
+
+    /// A valid HA config: two channels in two distinct failure domains.
     fn gateway_config(splice_addr: SocketAddr) -> GatewayConfig {
         GatewayConfig {
-            endpoints: vec!["wss://gateway.test:8443".to_string()],
+            endpoints: vec![
+                endpoint("wss://gw-a.test:8443", "az-a"),
+                endpoint("wss://gw-b.test:8443", "az-b"),
+            ],
             server_name: "gateway.test".to_string(),
             splice_addr,
             max_concurrent_splices: DEFAULT_MAX_CONCURRENT_SPLICES,
+            min_control_channels: DEFAULT_MIN_CONTROL_CHANNELS,
             connect_timeout: Duration::from_secs(10),
             backoff_initial: Duration::from_secs(1),
             backoff_max: Duration::from_secs(30),
@@ -353,6 +454,50 @@ mod tests {
             assert!(addr.ip().is_loopback());
             gateway_config(addr).validate().unwrap();
         }
+    }
+
+    #[test]
+    fn ha_requires_at_least_two_diverse_failure_domains() {
+        let addr = parse_splice_addr(DEFAULT_SPLICE_ADDR).unwrap();
+
+        // Two channels but ONE failure domain: not diverse — one AZ outage takes
+        // both, so it is not HA. Fail closed.
+        let mut same_domain = gateway_config(addr);
+        same_domain.endpoints = vec![
+            endpoint("wss://gw-a.test:8443", "az-a"),
+            endpoint("wss://gw-b.test:8443", "az-a"),
+        ];
+        assert!(matches!(
+            same_domain.validate(),
+            Err(ConfigError::Invalid { .. })
+        ));
+
+        // Fewer endpoints than min_control_channels.
+        let mut too_few = gateway_config(addr);
+        too_few.endpoints = vec![endpoint("wss://gw-a.test:8443", "az-a")];
+        assert!(matches!(
+            too_few.validate(),
+            Err(ConfigError::Invalid { .. })
+        ));
+
+        // A duplicate authority is not a second channel.
+        let mut dup = gateway_config(addr);
+        dup.endpoints = vec![
+            endpoint("wss://gw-a.test:8443", "az-a"),
+            endpoint("wss://gw-a.test:8443", "az-b"),
+        ];
+        assert!(matches!(dup.validate(), Err(ConfigError::Invalid { .. })));
+    }
+
+    #[test]
+    fn single_instance_mode_allows_one_channel() {
+        // min_control_channels == 1 opts out of the diversity requirement (there is
+        // nothing to diversify) — S14's single-Gateway posture stays valid.
+        let addr = parse_splice_addr(DEFAULT_SPLICE_ADDR).unwrap();
+        let mut single = gateway_config(addr);
+        single.endpoints = vec![endpoint("wss://gw-a.test:8443", "az-a")];
+        single.min_control_channels = 1;
+        single.validate().unwrap();
     }
 
     #[test]
@@ -395,6 +540,13 @@ mod tests {
         no_splices.max_concurrent_splices = 0;
         assert!(matches!(
             no_splices.validate(),
+            Err(ConfigError::Invalid { .. })
+        ));
+
+        let mut no_channels = gateway_config(addr);
+        no_channels.min_control_channels = 0;
+        assert!(matches!(
+            no_channels.validate(),
             Err(ConfigError::Invalid { .. })
         ));
     }

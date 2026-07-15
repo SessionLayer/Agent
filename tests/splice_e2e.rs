@@ -224,6 +224,9 @@ async fn agent_splices_a_real_ssh_session_into_the_nodes_own_sshd() {
         &endpoint,
         "--gateway-server-name",
         gw.server_name(),
+        // Single-Gateway E2E: opt out of the ≥2-diverse-channel HA requirement.
+        "--min-control-channels",
+        "1",
         "--splice-addr",
         &splice_addr,
     ]);

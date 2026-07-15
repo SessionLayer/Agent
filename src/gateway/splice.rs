@@ -59,7 +59,7 @@ fn endpoint_is_configured(config: &GatewayConfig, endpoint: &str) -> bool {
     config
         .endpoints
         .iter()
-        .filter_map(|e| transport::authority_of(e).ok())
+        .filter_map(|e| transport::authority_of(&e.url).ok())
         .any(|a| a == wanted)
 }
 
@@ -417,10 +417,17 @@ mod tests {
 
     fn config_with(endpoints: &[&str]) -> GatewayConfig {
         GatewayConfig {
-            endpoints: endpoints.iter().map(|s| s.to_string()).collect(),
+            endpoints: endpoints
+                .iter()
+                .map(|s| crate::config::GatewayEndpoint {
+                    url: s.to_string(),
+                    failure_domain: s.to_string(),
+                })
+                .collect(),
             server_name: "gateway".to_string(),
             splice_addr: "127.0.0.1:22".parse().unwrap(),
             max_concurrent_splices: 32,
+            min_control_channels: 1,
             connect_timeout: Duration::from_secs(5),
             backoff_initial: Duration::from_secs(1),
             backoff_max: Duration::from_secs(30),
