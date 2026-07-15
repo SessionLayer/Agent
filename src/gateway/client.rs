@@ -442,11 +442,12 @@ pub(crate) async fn preface(
     role: Role,
     timeout: Duration,
 ) -> Result<Negotiated, GatewayError> {
-    // The preface itself is sent at our own max major (§3); every later frame
-    // carries the negotiated major.
-    let ver = version::PROTOCOL_MAJOR as u8;
+    // The preface itself is sent at our own WIRE max major (§3); every later frame
+    // carries the negotiated major. The wire version is deliberately independent of
+    // the gRPC/component version (F-wireversion-2).
+    let ver = version::WIRE_PROTOCOL_MAJOR as u8;
 
-    let hello = wire::out::hello(ver, version::component_info());
+    let hello = wire::out::hello(ver, version::wire_component_info());
     ws.send(Message::Binary(hello.into()))
         .await
         .map_err(|e| GatewayError::Io {
@@ -497,7 +498,7 @@ fn negotiated_from(ack: crate::proto::wire::GatewayHelloAck) -> Result<Negotiate
         GatewayError::Preface("HELLO_ACK carried no selected version".to_string())
     })?;
 
-    let (min, max) = (version::PROTOCOL_MIN, version::PROTOCOL_MAX);
+    let (min, max) = (version::WIRE_PROTOCOL_MIN, version::WIRE_PROTOCOL_MAX);
     let in_range = selected.major == min.major
         && selected.major == max.major
         && selected.minor >= min.minor

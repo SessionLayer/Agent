@@ -36,7 +36,7 @@ pub type GatewayWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>
 /// is taken from the contract, never from the endpoint string** — the two roles
 /// have fixed paths (§1), so neither an operator typo nor a hostile
 /// `dial_back_endpoint` can steer the Agent onto a different resource.
-fn authority_of(endpoint: &str) -> Result<String, GatewayError> {
+pub(crate) fn authority_of(endpoint: &str) -> Result<String, GatewayError> {
     let uri: Uri = endpoint.parse().map_err(|_| GatewayError::Endpoint {
         endpoint: endpoint.to_string(),
         reason: "not a valid URI".to_string(),
@@ -57,8 +57,10 @@ fn authority_of(endpoint: &str) -> Result<String, GatewayError> {
         reason: "no host".to_string(),
     })?;
     let port = uri.port_u16().unwrap_or(443);
-    Ok(if host.contains(':') {
-        format!("[{host}]:{port}") // IPv6 literal
+    // `Uri::host()` keeps the brackets on an IPv6 literal, so only add them when a
+    // bare `::1`-style host slips through — never double them.
+    Ok(if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
     } else {
         format!("{host}:{port}")
     })

@@ -64,9 +64,9 @@ pub mod proto {
 }
 
 /// Long-form version string surfaced by `--version`: build SemVer plus the
-/// supported protocol range and the gRPC contract the generated types come from.
-/// The `1.0` literals are guarded against drift from [`version::PROTOCOL_MIN`]/
-/// [`version::PROTOCOL_MAX`] by a unit test.
+/// supported wire-protocol range and the gRPC contract the generated types come
+/// from. The `1.0` literals are guarded against drift from
+/// [`version::WIRE_PROTOCOL_MIN`]/[`version::WIRE_PROTOCOL_MAX`] by a unit test.
 pub const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\ncomponent:      SessionLayer Agent",

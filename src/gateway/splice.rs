@@ -39,10 +39,29 @@ use crate::proto::wire::{
 /// `STREAM_DATA` frame and a peer's frame bound is never exceeded.
 const CHUNK: usize = 16 * 1024;
 
+/// After one splice direction reaches EOF, how long the other may keep draining to
+/// its own EOF before it is cut. Bounds a half-open peer from pinning the splice
+/// (and its concurrency permit) open; it only starts once the first direction ends.
+const HALF_CLOSE_DRAIN: Duration = Duration::from_secs(10);
+
 /// A dial-back failure, as the code the Gateway is told plus the detail for our own
 /// operator log. The SSH user always sees the single generic §7.1 outcome
 /// ("target node is offline / unreachable") — this never reaches them.
 type Failure = (DialBackErrorCode, GatewayError);
+
+/// Whether a wire-supplied `dial_back_endpoint` is one of the Gateways this Agent
+/// was configured to reach (authority match). A malformed endpoint is not
+/// configured. See the confused-deputy note in [`dial_back`].
+fn endpoint_is_configured(config: &GatewayConfig, endpoint: &str) -> bool {
+    let Ok(wanted) = transport::authority_of(endpoint) else {
+        return false;
+    };
+    config
+        .endpoints
+        .iter()
+        .filter_map(|e| transport::authority_of(e).ok())
+        .any(|a| a == wanted)
+}
 
 /// A dial-back that has reached `STREAM_OPEN`: the Gateway accepted the token and
 /// the node's `sshd` is connected. Splitting the dial-back here is what lets the
@@ -76,6 +95,30 @@ pub async fn dial_back(
     // the short time we need it, so it does not linger in a plain heap allocation.
     let token = Zeroizing::new(std::mem::take(&mut req.token));
     let request_id = req.request_id.clone();
+
+    // Defence in depth for the confused-deputy invariant (§5/§8). The splice target
+    // is already loopback-only; here we constrain the OTHER wire-carried destination
+    // — `dial_back_endpoint`, the address the Agent connects back to. The contract
+    // fixes it to "the owning Gateway's address; in single-Gateway mode it is the
+    // same Gateway", so it MUST be one of the Gateways this Agent was configured to
+    // talk to. Otherwise an authenticated-but-hostile Gateway could aim the Agent's
+    // TCP connect + TLS ClientHello at any address the node can reach (a weak but
+    // real network-pivot / recon primitive), even though the TLS handshake itself
+    // would then fail closed against the pinned CA. Refuse before dialling.
+    if !endpoint_is_configured(config, &req.dial_back_endpoint) {
+        tracing::warn!(
+            request_id = %request_id.escape_debug(),
+            endpoint = %req.dial_back_endpoint.escape_debug(),
+            "refusing a dial-back to an endpoint this Agent was not configured to reach"
+        );
+        return Err((
+            DialBackErrorCode::Refused,
+            GatewayError::Endpoint {
+                endpoint: req.dial_back_endpoint.clone(),
+                reason: "not among the configured --gateway-endpoint set".to_string(),
+            },
+        ));
+    }
 
     let mut ws = transport::connect(
         &req.dial_back_endpoint,
@@ -333,14 +376,23 @@ async fn splice(ws: GatewayWs, tcp: TcpStream, negotiated: Negotiated) -> Stream
         reason
     });
 
-    // Whichever half ends first ends the session; the other is torn down with it.
+    // Clean half-close (matches the S8 bridge): when one direction reaches EOF its
+    // task has ALREADY shut down its peer's write half (node_wr.shutdown /
+    // sink.close), so the peer sees EOF and finishes. We then let the OTHER
+    // direction drain its in-flight bytes to its own EOF rather than abort()ing it
+    // mid-flight — bounded by HALF_CLOSE_DRAIN so a peer that half-closes without
+    // reciprocating cannot pin the splice (and its concurrency permit) open. The
+    // grace only starts once the first direction has ended, so it never truncates a
+    // live session.
     let (mut to_node, mut to_gateway) = (to_node, to_gateway);
     tokio::select! {
         r = &mut to_node => {
+            let _ = tokio::time::timeout(HALF_CLOSE_DRAIN, &mut to_gateway).await;
             to_gateway.abort();
             r.unwrap_or(StreamCloseReason::IoError)
         }
         r = &mut to_gateway => {
+            let _ = tokio::time::timeout(HALF_CLOSE_DRAIN, &mut to_node).await;
             to_node.abort();
             r.unwrap_or(StreamCloseReason::IoError)
         }
@@ -360,6 +412,51 @@ mod tests {
             assert!(cap <= max_frame_bytes as usize);
             let frame = wire::encode(1, wire::MsgType::StreamData, &vec![0u8; cap]);
             assert_eq!(frame.len(), wire::FRAME_HEADER_LEN + cap);
+        }
+    }
+
+    fn config_with(endpoints: &[&str]) -> GatewayConfig {
+        GatewayConfig {
+            endpoints: endpoints.iter().map(|s| s.to_string()).collect(),
+            server_name: "gateway".to_string(),
+            splice_addr: "127.0.0.1:22".parse().unwrap(),
+            max_concurrent_splices: 32,
+            connect_timeout: Duration::from_secs(5),
+            backoff_initial: Duration::from_secs(1),
+            backoff_max: Duration::from_secs(30),
+            drain_deadline: Duration::from_secs(30),
+        }
+    }
+
+    #[test]
+    fn dial_back_endpoint_must_be_a_configured_gateway() {
+        // The confused-deputy defence for the wire-carried dial-back address: only a
+        // Gateway this Agent was configured to reach is dialled. An authenticated but
+        // hostile Gateway cannot aim the Agent's connect at an arbitrary host:port.
+        let config = config_with(&["wss://gw-a.example:8443", "wss://gw-b.example:8443"]);
+
+        // Same host:port (any path) is allowed — the path is contract-fixed anyway.
+        assert!(endpoint_is_configured(
+            &config,
+            "wss://gw-a.example:8443/agent/v1/dialback"
+        ));
+        assert!(endpoint_is_configured(&config, "wss://gw-b.example:8443"));
+
+        // Anything not in the configured set is refused: a different host, a
+        // different port, a bare IP, loopback, link-local metadata, or garbage.
+        for pivot in [
+            "wss://gw-a.example:9999",
+            "wss://evil.example:8443",
+            "wss://10.0.0.5:8443",
+            "wss://127.0.0.1:8443",
+            "wss://169.254.169.254:80",
+            "not-a-uri",
+            "ws://gw-a.example:8443",
+        ] {
+            assert!(
+                !endpoint_is_configured(&config, pivot),
+                "{pivot} must not be treated as a configured Gateway"
+            );
         }
     }
 }

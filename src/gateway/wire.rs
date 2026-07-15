@@ -486,7 +486,7 @@ mod tests {
 
     #[test]
     fn agent_outbound_hello_carries_the_component_range() {
-        let frame = out::hello(V, crate::version::component_info());
+        let frame = out::hello(V, crate::version::wire_component_info());
         match decode(&frame, V, MAX, Role::Control) {
             // The Agent never *receives* HELLO, so decoding its own must be
             // refused by direction — proving the guard is not type-blind.
