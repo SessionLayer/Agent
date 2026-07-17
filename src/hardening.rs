@@ -11,11 +11,15 @@
 //!   bootstrap CA + join files are read-only; everything else is read-only (or
 //!   unreachable). A compromised Agent cannot tamper with binaries/config or drop
 //!   persistence.
-//! - **Landlock network egress** — TCP `connect` is allowed only to the exact set
-//!   of destination **ports** the Agent legitimately reaches: the CP identity
+//! - **Landlock network egress** — TCP `connect` is kernel-confined to the exact
+//!   set of destination **ports** the Agent legitimately reaches (the CP identity
 //!   plane, each configured Gateway, the **loopback splice** to the node's sshd,
-//!   and (only when configured) the OTLP collector. No other egress — the Agent
-//!   cannot be used as a network pivot even if a Gateway is hostile.
+//!   and — when configured — the OTLP collector). This narrows the *port* surface
+//!   as defence-in-depth; it does **not** scope by host/IP and does **not** cover
+//!   UDP (Landlock filters TCP `connect` by port only, and only on Linux ≥6.7). The
+//!   fine-grained "only the configured peers" egress control is the application
+//!   layer (loopback-only splice, dial-back affinity, pinned-CA TLS) plus the
+//!   deploy-time NetworkPolicy (`deploy/`), which enforces host/IP + UDP.
 //! - **seccomp** — a syscall allow-list scoped to the runtime + TLS + WebSocket +
 //!   dial-back + loopback-splice path. Anything outside it **kills the process**
 //!   (`SECCOMP_RET_KILL_PROCESS`) — clean fail-closed, and it sidesteps the
@@ -75,15 +79,24 @@ impl HardeningPlan {
         };
         // CP identity plane (enroll + renew).
         push(url_port(&config.cp_endpoint, TLS_DEFAULT_PORT), &mut ports);
+        let mut needs_dns = endpoint_needs_dns(&config.cp_endpoint);
         if let Some(gw) = gateway {
             // Every configured Gateway control channel + the same-Gateway dial-back.
             for ep in &gw.endpoints {
                 push(url_port(&ep.url, TLS_DEFAULT_PORT), &mut ports);
+                needs_dns |= endpoint_needs_dns(&ep.url);
             }
             // The loopback splice to the node's own sshd — the platform's whole point.
             push(Some(gw.splice_addr.port()), &mut ports);
         }
         push(otlp_port, &mut ports);
+        // A hostname endpoint resolves via glibc getaddrinfo; a truncated UDP answer
+        // makes it retry over TCP:53, which the egress ruleset would otherwise deny
+        // (fail-closed, not fail-deadly). Permit TCP:53 when any endpoint is a name.
+        // (UDP DNS is not governed by Landlock net at all — it filters TCP only.)
+        if needs_dns {
+            push(Some(53), &mut ports);
+        }
         ports.sort_unstable();
 
         let mut read_only_paths = vec![config.bootstrap_ca_file.clone()];
@@ -115,6 +128,26 @@ fn join_material_paths(join: &JoinConfig) -> Vec<PathBuf> {
 /// endpoint names no derivable port.
 pub fn otlp_port(endpoint: &str) -> Option<u16> {
     url_port(endpoint, OTLP_DEFAULT_PORT)
+}
+
+/// Whether an endpoint's host is a DNS name (not an IP literal). Such a deploy
+/// resolves via glibc `getaddrinfo`, whose truncated-answer path can fall back to
+/// TCP:53 (F4).
+fn endpoint_needs_dns(s: &str) -> bool {
+    use std::net::IpAddr;
+    use tokio_tungstenite::tungstenite::http::Uri;
+    let host = s
+        .parse::<Uri>()
+        .ok()
+        .and_then(|uri| uri.host().map(str::to_string))
+        .or_else(|| s.rsplit_once(':').map(|(h, _)| h.to_string()));
+    match host {
+        Some(h) => {
+            let h = h.trim_start_matches('[').trim_end_matches(']');
+            !h.is_empty() && h.parse::<IpAddr>().is_err()
+        }
+        None => false,
+    }
 }
 
 /// Extract the destination port from an endpoint string: an `https://`/`wss://`
@@ -284,8 +317,9 @@ mod tests {
         let gateway = gw("127.0.0.1:2222", &["wss://gw-a:8443", "wss://gw-b:9443"]);
         let plan = HardeningPlan::derive(&config, &gateway, Some(4317));
 
-        // The egress allow-list MUST contain every real destination and nothing else.
-        assert_eq!(plan.allowed_connect_ports, vec![2222, 4317, 8443, 9443]);
+        // The egress allow-list MUST contain every real destination and nothing else
+        // — incl. TCP:53 for the TCP-DNS fallback (the endpoints are hostnames).
+        assert_eq!(plan.allowed_connect_ports, vec![53, 2222, 4317, 8443, 9443]);
         assert_eq!(plan.read_write_paths, vec![PathBuf::from("/var/lib/agent")]);
         assert_eq!(plan.read_only_paths, vec![PathBuf::from("/etc/sl/ca.pem")]);
     }
@@ -319,12 +353,47 @@ mod tests {
         };
         let config = base_config("/data", "https://cp:9443", join);
         let plan = HardeningPlan::derive(&config, &None, None);
-        assert_eq!(plan.allowed_connect_ports, vec![9443]);
+        // hostname CP ⇒ TCP:53 for the DNS fallback + the CP port; nothing else.
+        assert_eq!(plan.allowed_connect_ports, vec![53, 9443]);
         assert!(plan
             .read_only_paths
             .contains(&PathBuf::from("/etc/sl/op.crt")));
         assert!(plan
             .read_only_paths
             .contains(&PathBuf::from("/etc/sl/op.key")));
+    }
+
+    #[test]
+    fn tcp_dns_fallback_port_is_added_only_for_hostname_endpoints() {
+        let join = || JoinConfig::Token {
+            token: Some(zeroize::Zeroizing::new("t".into())),
+            token_file: None,
+        };
+        // IP-literal CP + Gateway ⇒ no getaddrinfo ⇒ no TCP:53.
+        let ip = base_config("/data", "https://10.0.0.5:9443", join());
+        let ip_plan =
+            HardeningPlan::derive(&ip, &gw("127.0.0.1:22", &["wss://10.0.0.6:8443"]), None);
+        assert!(
+            !ip_plan.allowed_connect_ports.contains(&53),
+            "IP-literal endpoints need no DNS"
+        );
+
+        // A hostname anywhere ⇒ TCP:53 permitted for the truncated-answer fallback.
+        let host = base_config("/data", "https://10.0.0.5:9443", join());
+        let host_plan =
+            HardeningPlan::derive(&host, &gw("127.0.0.1:22", &["wss://gw.example:8443"]), None);
+        assert!(
+            host_plan.allowed_connect_ports.contains(&53),
+            "a hostname endpoint needs DNS"
+        );
+    }
+
+    #[test]
+    fn endpoint_needs_dns_distinguishes_names_from_ip_literals() {
+        assert!(endpoint_needs_dns("https://cp.example:9443"));
+        assert!(endpoint_needs_dns("wss://gw.internal:8443"));
+        assert!(!endpoint_needs_dns("https://127.0.0.1:9443"));
+        assert!(!endpoint_needs_dns("https://10.0.0.5:8443"));
+        assert!(!endpoint_needs_dns("wss://[::1]:8443"));
     }
 }

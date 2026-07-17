@@ -1,0 +1,73 @@
+# Egress NetworkPolicy for the SessionLayer Agent (Part A / NFR-5 / Design §15).
+#
+# This is the network layer's half of "restricted egress": it enforces
+# host/IP + UDP scoping, which the in-process Landlock egress ruleset canNOT
+# (Landlock filters TCP `connect` by port only, has no UDP support, and needs
+# Linux ≥6.7). The two are defence-in-depth: Landlock narrows the port surface
+# in-process (even against a Landlock-unaware compromise), the NetworkPolicy pins
+# the destinations at the CNI.
+#
+# The Agent is OUTBOUND-ONLY (a node needs no inbound reachability), so ingress is
+# denied entirely. Egress is limited to: the CP identity plane, the node's
+# configured Gateways, and DNS. The loopback splice to the node's own sshd
+# (127.0.0.1:22) is in-pod traffic and is not subject to NetworkPolicy.
+#
+# Requires a NetworkPolicy-enforcing CNI (Calico, Cilium, …). Adjust the
+# namespace/pod selectors + ports to your deployment.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sessionlayer-agent-egress
+  namespace: sessionlayer
+  labels:
+    app.kubernetes.io/name: sessionlayer-agent
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: sessionlayer-agent
+  policyTypes:
+    - Ingress
+    - Egress
+  # Outbound-only: no inbound reachability (Design §9.2).
+  ingress: []
+  egress:
+    # DNS (to resolve the CP + Gateway hostnames) — UDP and TCP 53 to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # The CP identity plane (enroll + renew), mTLS gRPC.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: sessionlayer-controlplane
+      ports:
+        - protocol: TCP
+          port: 9443
+    # The node's configured Gateways (control channel + dial-back), WSS + mTLS.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: sessionlayer-gateway
+      ports:
+        - protocol: TCP
+          port: 8443
+    # OTLP collector — uncomment only if OTEL_EXPORTER_OTLP_ENDPOINT is set.
+    # - to:
+    #     - namespaceSelector:
+    #         matchLabels:
+    #           kubernetes.io/metadata.name: observability
+    #       podSelector:
+    #         matchLabels:
+    #           app.kubernetes.io/name: otel-collector
+    #   ports:
+    #     - protocol: TCP
+    #       port: 4317

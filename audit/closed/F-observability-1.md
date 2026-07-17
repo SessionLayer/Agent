@@ -16,9 +16,11 @@ correlates them to the platform trace by stamping the `sessionlayer.session_id`
 it already holds (attribute correlation only; the frozen wire / SLDB1 token are
 **not** touched, per §2.2). An OTLP/gRPC exporter (tonic, ring TLS) ships them to a
 collector when `OTEL_EXPORTER_OTLP_ENDPOINT` is set; otherwise only the local
-`tracing`/fmt subscriber runs, unchanged. Spans carry IDs/enums/durations only —
-`tests/telemetry_no_content.rs` proves no token/key/plaintext reaches any span,
-attribute, or log (§5).
+`tracing`/fmt subscriber runs, unchanged. Spans carry IDs/enums/durations as
+attributes **and span-events** (info+ `tracing` events on a span export as OTel
+span-events; e.g. an escaped `request_id` or an error *category* string rides along)
+— all metadata, never content: `tests/telemetry_no_content.rs` proves no token/key/
+plaintext reaches any span, attribute, event, or log (§5).
 
 ## Why the remaining items are not gaps for the Agent
 - **No inbound metrics/health endpoint by design.** The Agent is an outbound-only

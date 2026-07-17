@@ -11,8 +11,9 @@
 #                                        allow-list (the app narrows it further)
 #
 # Egress is limited to the CP identity plane, the node's diverse Gateways, and the
-# loopback splice to the node's own sshd — enforce it at the network layer too
-# (a NetworkPolicy / CNI egress rule) to match the in-process Landlock egress.
+# loopback splice to the node's own sshd. The in-process Landlock egress is
+# port-scoped (TCP only); the host/IP + UDP enforcement is the shipped
+# `agent-networkpolicy.yaml` (apply it alongside this DaemonSet).
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:

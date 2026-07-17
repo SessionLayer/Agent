@@ -143,6 +143,13 @@ struct RunArgs {
     /// Used by CI/E2E.
     #[arg(long)]
     once: bool,
+
+    /// Abort startup unless Landlock is **fully** enforced (fail-closed for the
+    /// filesystem + network-egress confinement). The default accepts a documented
+    /// degrade on kernels lacking Landlock or its network ABI (Linux <6.7); set
+    /// this for regulated deploys that must not run with degraded confinement.
+    #[arg(long)]
+    require_full_landlock: bool,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -296,6 +303,7 @@ fn main() -> anyhow::Result<ExitCode> {
     match cli.command {
         Some(Command::Run(args)) => {
             let once = args.once;
+            let require_full_landlock = args.require_full_landlock;
             // Built (and loopback-validated) BEFORE any credential work, so a bad
             // splice target or too-few diverse channels fails startup closed rather
             // than after enrolling. Also gives hardening the concrete paths/ports.
@@ -308,8 +316,17 @@ fn main() -> anyhow::Result<ExitCode> {
             let otlp_port = telemetry::otlp_endpoint()
                 .as_deref()
                 .and_then(hardening::otlp_port);
-            hardening::apply(&config, &gateway, otlp_port)
+            let report = hardening::apply(&config, &gateway, otlp_port)
                 .context("applying Tier-0 runtime hardening")?;
+            if require_full_landlock && report.landlock != hardening::Landlock::FullyEnforced {
+                anyhow::bail!(
+                    "--require-full-landlock is set but Landlock is {:?}, not FullyEnforced — \
+                     refusing to run with degraded filesystem/network-egress confinement (the \
+                     network ABI needs Linux ≥6.7). Deploy on a Landlock-capable kernel, or drop \
+                     the flag to accept the documented degrade.",
+                    report.landlock
+                );
+            }
 
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()

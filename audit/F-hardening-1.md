@@ -76,6 +76,12 @@ silent one), not a fail-open: the process still refuses to run non-hardened at t
 **seccomp** layer (a seccomp install failure aborts). Deploy on a Landlock-capable
 kernel + the container `securityContext` (`deploy/`) for full confinement.
 
+**Opt-in fail-closed for regulated deploys.** `--require-full-landlock` aborts
+startup unless `report.landlock == FullyEnforced`, so a deploy that must not run
+with degraded filesystem/egress confinement can turn the default Accepted-Risk
+degrade into a hard failure. The default stays BestEffort (the sanctioned
+kernel-gap degrade) so single-instance / older-kernel deploys keep working.
+
 ## Residual 2 — OTLP exporter threads predate the Landlock domain
 When (and only when) `OTEL_EXPORTER_OTLP_ENDPOINT` is set, the OTLP exporter runs
 on a small dedicated tokio runtime built in `telemetry::init`, which runs **before**
@@ -90,10 +96,55 @@ The alternative — initialising OTLP after hardening — would lose the startup
 (and the exporter is off by default, so the common path has no such threads at all).
 Accepted.
 
+## Residual 3 — Landlock network egress is TCP-only + port-scoped (not host/IP)
+The in-process Landlock egress ruleset is a **coarse** control by construction:
+- it filters **TCP `connect` by destination port only** — it does NOT scope by
+  host/IP, so on an allow-listed port a compromised process could `connect` to a
+  different host on that port;
+- it has **no UDP support** — outbound UDP is not confined by Landlock at all;
+- it needs **Linux ≥6.7 (ABI v4)**; on the common <6.7 LTS kernels (5.15 / 6.1 /
+  6.6, typical EKS/GKE) the network handling silently downgrades to
+  `PartiallyEnforced` (filesystem still enforced) — a soft degrade of the *egress*
+  control specifically.
+
+These are inherent to Landlock, not a bug. They are mitigated in depth, not relied
+on alone:
+- **Application layer (primary, kernel-version-independent):** the splice target is
+  loopback-validated and never taken from the wire (`config::parse_splice_addr`); a
+  dial-back must be exactly the arriving control channel's configured Gateway
+  (`gateway::client` affinity, F-connect-1); every leg is pinned-CA TLS 1.3 (a wrong
+  host fails the handshake). This is what actually stops "the Agent as a pivot".
+- **NetworkPolicy (`deploy/kubernetes/agent-networkpolicy.yaml`) — LOAD-BEARING,
+  not just defence-in-depth:** it is the control that actually enforces host/IP + UDP
+  scoping at the CNI, which Landlock cannot do at all (Landlock is TCP-connect,
+  port-only). Agent → CP + Gateways + DNS only; ingress denied. A deploy relying on
+  network-level egress confinement MUST ship it — it is not optional colour on the
+  DaemonSet.
+- **`--require-full-landlock`:** turns the <6.7 egress degrade into a hard abort for
+  deploys that require it.
+Landlock net remains valuable as an in-process port backstop even against a
+Landlock-unaware compromise; the prose (`hardening.rs`, README, deploy docs) states
+the confinement accurately (TCP-connect-port on ≥6.7), not as absolute pivot-proofing.
+
+## Note — aarch64 allow-list is CI-unproven (F7)
+The seccomp allow-list is shared across x86_64 + aarch64 (the `ioctl`/FIONREAD fix
+lives in the common list), but CI runs on **x86_64 only**. glibc's syscall footprint
+differs by arch (e.g. `arch_prctl` is x86_64-only; aarch64 lacks the legacy
+non-`*at` forms). If aarch64 images ship, the hardened Docker E2E + `seccomp_kill` /
+DNS guards MUST run on an aarch64 runner before relying on the KILL-default there.
+
 ## Verification
-- `tests/hardening_e2e.rs` — hardening is applied+logged before credential work, and
-  fails closed on a missing data-dir.
-- Docker `tests/splice_e2e.rs` — a full certificate-authenticated SSH session
-  completes under the hardened binary (the data path is not regressed).
+- `tests/seccomp_kill.rs` — a disallowed syscall is SIGSYS-killed; an allowed one
+  runs; **`ioctl(FIONREAD)` is allowed but other ioctls are killed** (arg-restriction
+  real); and **glibc hostname resolution survives the filter** (F1/F3 regression
+  guards — they FAIL before the ioctl fix, PASS after).
+- `tests/hardening_e2e.rs` — hardening is applied+logged, the Agent **survives the
+  filter to the join path** (asserts NOT signal-killed + a post-filter marker, so an
+  incomplete allow-list on the startup path is caught — F2), and it fails closed on a
+  missing data-dir.
+- Docker `tests/splice_e2e.rs` — a full cert-authenticated SSH session **+ an SFTP
+  transfer**, with the OTLP exporter enabled, complete under the hardened binary (the
+  data path is not regressed).
 - `src/hardening.rs` unit tests — the egress allow-list covers CP + every Gateway +
-  the loopback splice + OTLP, and nothing else.
+  the loopback splice + OTLP (+ TCP:53 only when an endpoint is a hostname), and
+  nothing else.

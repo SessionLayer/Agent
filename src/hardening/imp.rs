@@ -101,9 +101,17 @@ fn apply_landlock(plan: &HardeningPlan) -> anyhow::Result<Landlock> {
         let fd = PathFd::new(p).with_context(|| format!("data-dir {p:?} must exist"))?;
         ruleset = ruleset.add_rule(PathBeneath::new(fd, rw))?;
     }
-    // Read-only: bootstrap CA + join files (an inline token has no file → skip).
+    // Read-only: bootstrap CA + join files. Grant the containing DIRECTORY (not the
+    // file) so a kubelet projected-token / configmap rotation — which atomically
+    // swaps the file's inode via a new `..data` dir + symlink flip — stays readable
+    // at a later re-enroll (F5: an inode-scoped file rule would deny the rotated
+    // token). An inline token has no file → skipped.
     for p in &plan.read_only_paths {
-        if let Ok(fd) = PathFd::new(p) {
+        let target = p
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(p);
+        if let Ok(fd) = PathFd::new(target) {
             ruleset = ruleset.add_rule(PathBeneath::new(fd, ro))?;
         }
     }
@@ -139,7 +147,10 @@ fn install_seccomp() -> anyhow::Result<usize> {
 /// allocates) and install it in the child (no allocation → fork-safe).
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(super) fn compile_seccomp() -> anyhow::Result<(seccompiler::BpfProgram, usize)> {
-    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule};
+    use seccompiler::{
+        BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+        SeccompRule,
+    };
 
     let syscalls = allowed_syscalls();
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
@@ -147,6 +158,28 @@ pub(super) fn compile_seccomp() -> anyhow::Result<(seccompiler::BpfProgram, usiz
         // An empty rule set means "match unconditionally" → the match action (Allow).
         rules.insert(*sc, vec![]);
     }
+
+    // `ioctl` is arg-restricted, NOT blanket-allowed: glibc `getaddrinfo` issues
+    // `ioctl(fd, FIONREAD)` before each `recvfrom` on a UDP DNS answer, so a missing
+    // ioctl would SIGSYS-kill the Agent on its first *hostname* lookup (the numeric
+    // loopback tests skip getaddrinfo, which is how this hid). Allow only the
+    // resolver's `FIONREAD`/`FIONBIO` request codes; every other ioctl (e.g.
+    // `TIOCSTI` input injection) stays killed.
+    // c_ulong == u64 on the LP64 targets, so no cast (clippy: same-type).
+    let ioctl_rules = [libc::FIONREAD, libc::FIONBIO]
+        .into_iter()
+        .map(|req| {
+            SeccompRule::new(vec![SeccompCondition::new(
+                1, // ioctl(fd, request, ...): the request is arg 1
+                SeccompCmpArgLen::Qword,
+                SeccompCmpOp::Eq,
+                req,
+            )?])
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    rules.insert(libc::SYS_ioctl, ioctl_rules);
+
+    let syscall_count = rules.len();
     let filter = SeccompFilter::new(
         rules,
         SeccompAction::KillProcess, // any syscall off the allow-list kills the process
@@ -154,7 +187,7 @@ pub(super) fn compile_seccomp() -> anyhow::Result<(seccompiler::BpfProgram, usiz
         target_arch(),
     )?;
     let bpf: BpfProgram = filter.try_into()?;
-    Ok((bpf, syscalls.len()))
+    Ok((bpf, syscall_count))
 }
 
 /// Install a compiled seccomp program on every thread of the process (TSYNC).

@@ -63,6 +63,83 @@ fn a_syscall_off_the_allow_list_kills_the_process() {
 }
 
 #[test]
+fn ioctl_is_arg_restricted_to_the_resolver_requests() {
+    // Regression guard for F1 (the fail-deadly getaddrinfo footgun): the filter must
+    // allow `ioctl(fd, FIONREAD)` (glibc's UDP-DNS receive path needs it) but KILL
+    // any other ioctl request — proving the fix is arg-restricted, not blanket. This
+    // FAILS before F1 (ioctl absent → FIONREAD killed) and PASSES after.
+    let program = testing::compile_seccomp().expect("compile the seccomp program");
+
+    let allowed = in_forked_child(|| {
+        if testing::apply_seccomp(&program).is_err() {
+            unsafe { libc::_exit(97) };
+        }
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        let mut avail: libc::c_int = 0;
+        unsafe {
+            libc::syscall(
+                libc::SYS_ioctl,
+                fd as libc::c_long,
+                libc::FIONREAD as libc::c_long,
+                &mut avail as *mut libc::c_int as libc::c_long,
+            );
+        }
+    });
+    assert!(
+        !libc::WIFSIGNALED(allowed),
+        "ioctl(FIONREAD) must be allowed — glibc getaddrinfo needs it; child killed by {}",
+        libc::WTERMSIG(allowed)
+    );
+
+    let denied = in_forked_child(|| {
+        if testing::apply_seccomp(&program).is_err() {
+            unsafe { libc::_exit(97) };
+        }
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        // TIOCGWINSZ is a benign ioctl that is NOT on the resolver allow-list.
+        unsafe {
+            libc::syscall(
+                libc::SYS_ioctl,
+                fd as libc::c_long,
+                libc::TIOCGWINSZ as libc::c_long,
+                0i64,
+            );
+        }
+    });
+    assert!(
+        libc::WIFSIGNALED(denied) && libc::WTERMSIG(denied) == libc::SIGSYS,
+        "a non-resolver ioctl must be KILLed by SIGSYS — the arg-restriction must be real"
+    );
+}
+
+#[test]
+fn glibc_hostname_resolution_survives_the_filter() {
+    // The real-path guard the numeric-loopback E2E could never give: resolving a
+    // HOSTNAME under the production filter must NOT self-KILL (127.0.0.1 literals
+    // skip getaddrinfo, which is exactly how F1 hid). The only failure mode here is a
+    // seccomp SIGSYS — a network/DNS failure returns an error, not a kill, so there
+    // is no false failure where DNS is unavailable.
+    use std::net::ToSocketAddrs;
+    // Pre-warm NSS + the allocator in the parent so the forked child reuses loaded
+    // libraries (fork-safety: minimise child heap churn).
+    let _ = ("example.com", 443u16).to_socket_addrs();
+
+    let program = testing::compile_seccomp().expect("compile the seccomp program");
+    let status = in_forked_child(|| {
+        if testing::apply_seccomp(&program).is_err() {
+            unsafe { libc::_exit(97) };
+        }
+        let _ = ("example.com", 443u16).to_socket_addrs();
+    });
+    assert!(
+        !libc::WIFSIGNALED(status),
+        "hostname resolution under the filter was KILLED by signal {} — a resolver \
+         syscall (e.g. ioctl FIONREAD) is missing from the allow-list",
+        libc::WTERMSIG(status)
+    );
+}
+
+#[test]
 fn an_allowed_syscall_still_succeeds_under_the_filter() {
     // The mirror image: a syscall ON the allow-list (getpid) must NOT be killed —
     // the filter permits the real workload, it does not blanket-deny.
