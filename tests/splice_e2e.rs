@@ -289,6 +289,16 @@ async fn agent_splices_a_real_ssh_session_into_the_nodes_own_sshd() {
         "the session must land as the certificate's principal; got:\n{out}"
     );
 
+    // Part A (S21): the whole splice above ran under the HARDENED binary — the real
+    // Agent applied seccomp + Landlock (+ coredump hygiene) before it built its
+    // runtime and enrolled, and a full certificate-authenticated SSH session still
+    // completed. Prove hardening actually ran (it must never silently skip).
+    assert!(
+        node.logs().contains("Tier-0 runtime hardening applied"),
+        "the Agent must apply Tier-0 hardening; the splice ran under it. node log:\n{}",
+        node.logs()
+    );
+
     // (2) FR-AUD-4: the node's OWN sshd log carries the certificate key-id. This
     // trail is written by sshd, not by the Agent — the Agent cannot forge or
     // suppress it, which is precisely what makes it a second, independent record.
