@@ -12,6 +12,18 @@ when set), and a seccomp syscall allow-list (`SECCOMP_RET_KILL_PROCESS` on any
 syscall off the list). Applied **before** the tokio runtime is built so every
 worker inherits both the Landlock domain and the seccomp filter.
 
+**Egress control is layered — Landlock net is a coarse backstop, not the primary
+gate.** Landlock's `AccessNet::ConnectTcp` restricts by destination **port**, not
+host/address, so on an allowed port (e.g. the Gateway's) a compromised process
+could in principle `connect` to a *different* host on that same port. The Agent's
+*fine-grained* egress control is at the application layer and predates this
+session: the splice target is loopback-validated and never taken from the wire
+(`config::parse_splice_addr`), a dial-back endpoint must be exactly the arriving
+control channel's configured Gateway (`gateway::client` affinity check +
+`configured_endpoint`, F-connect-1), and every leg is pinned-CA TLS 1.3 (a wrong
+host fails the handshake). Landlock net narrows the *port* surface as
+defence-in-depth on top of those; it is not relied on as the sole egress control.
+
 Two residuals are accepted with justification; both fail **safe**, not open. Two
 deliberate design decisions are recorded below them.
 
