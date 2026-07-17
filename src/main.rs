@@ -28,6 +28,8 @@ use sessionlayer_agent::config::{
 use sessionlayer_agent::gateway::GatewayClient;
 use sessionlayer_agent::identity::{self, IdentityStore, RenewAhead, RenewAheadConfig};
 use sessionlayer_agent::mtls::ChannelParams;
+use sessionlayer_agent::supply_chain::{self, Bundle, TrustRoot, VerificationPolicy};
+use sessionlayer_agent::update::SelfUpdater;
 use sessionlayer_agent::{
     hardening, init_process, privilege, supervisor, telemetry, version, LONG_VERSION,
 };
@@ -61,6 +63,70 @@ struct Cli {
 enum Command {
     /// Join the platform and maintain the renewable mTLS identity.
     Run(RunArgs),
+    /// Verify a binary's Sigstore signature + SLSA provenance + release identity
+    /// (NFR-7). Exit 0 iff it would be trusted to run/update; exit 2 (refused) on
+    /// any failure. Fully offline against the pinned trusted root.
+    Verify(VerifyArgs),
+    /// Verify a candidate binary and, only if it passes, atomically install it
+    /// (fail closed — an unverified binary is never written into place).
+    Update(UpdateArgs),
+}
+
+#[derive(Debug, Parser)]
+struct VerifyArgs {
+    /// The candidate binary to verify.
+    #[arg(long)]
+    binary: PathBuf,
+    /// The cosign blob-signature Sigstore bundle for the binary.
+    #[arg(long)]
+    blob_bundle: PathBuf,
+    /// The SLSA provenance attestation Sigstore bundle for the binary.
+    #[arg(long)]
+    provenance: PathBuf,
+    /// The pinned Sigstore trusted root (`trusted_root.json`, operator-supplied).
+    #[arg(long)]
+    trusted_root: PathBuf,
+    /// Override the trusted source repository (default: SessionLayer/Agent).
+    #[arg(long)]
+    expect_source_repo: Option<String>,
+    /// Override the trusted `…workflow@refs/tags/v` SAN prefix.
+    #[arg(long)]
+    expect_workflow_ref_prefix: Option<String>,
+    /// Override the trusted OIDC issuer.
+    #[arg(long)]
+    expect_oidc_issuer: Option<String>,
+}
+
+impl VerifyArgs {
+    fn policy(&self) -> VerificationPolicy {
+        let mut p = VerificationPolicy::sessionlayer_agent();
+        if let Some(x) = &self.expect_source_repo {
+            p.source_repo_uri = x.clone();
+        }
+        if let Some(x) = &self.expect_workflow_ref_prefix {
+            p.workflow_ref_prefix = x.clone();
+        }
+        if let Some(x) = &self.expect_oidc_issuer {
+            p.oidc_issuer = x.clone();
+        }
+        p
+    }
+}
+
+#[derive(Debug, Parser)]
+struct UpdateArgs {
+    /// The downloaded candidate binary.
+    #[arg(long)]
+    candidate: PathBuf,
+    #[arg(long)]
+    blob_bundle: PathBuf,
+    #[arg(long)]
+    provenance: PathBuf,
+    #[arg(long)]
+    trusted_root: PathBuf,
+    /// Where the verified binary is atomically installed.
+    #[arg(long)]
+    install_to: PathBuf,
 }
 
 #[derive(Debug, Parser)]
@@ -296,12 +362,13 @@ fn main() -> anyhow::Result<ExitCode> {
     // Fail closed if the single explicit TLS backend cannot be installed.
     init_process().context("process initialisation")?;
 
-    // Fail closed if running as root — BEFORE any credential is loaded or issued
-    // (FR-CONN-6). A root agent could read the node host key and impersonate it.
-    privilege::require_non_root()?;
-
     match cli.command {
         Some(Command::Run(args)) => {
+            // Fail closed if running as root — BEFORE any credential is loaded or
+            // issued (FR-CONN-6). A root agent could read the node host key and
+            // impersonate it. `verify`/`update` load no credentials, so the refusal
+            // is scoped to the credential-bearing run path.
+            privilege::require_non_root()?;
             let once = args.once;
             let require_full_landlock = args.require_full_landlock;
             // Built (and loopback-validated) BEFORE any credential work, so a bad
@@ -334,6 +401,8 @@ fn main() -> anyhow::Result<ExitCode> {
                 .context("building the tokio runtime")?;
             runtime.block_on(run(config, gateway, once))
         }
+        Some(Command::Verify(args)) => run_verify(args),
+        Some(Command::Update(args)) => run_update(args),
         None => {
             let info = version::component_info();
             tracing::info!(
@@ -342,6 +411,66 @@ fn main() -> anyhow::Result<ExitCode> {
                 "SessionLayer Agent ready. Use the `run` subcommand to join and maintain identity."
             );
             Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+/// A verify/update refusal (NFR-7): anything that prevents *proving* the binary
+/// is a signed SessionLayer/Agent release exits here — fail closed, never run it.
+const EXIT_VERIFY_REFUSED: u8 = 2;
+
+fn load_trust(path: &std::path::Path) -> anyhow::Result<TrustRoot> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("reading pinned trusted root {}", path.display()))?;
+    Ok(TrustRoot::from_trusted_root_json(&bytes)?)
+}
+
+fn run_verify(args: VerifyArgs) -> anyhow::Result<ExitCode> {
+    let policy = args.policy();
+    let outcome = load_trust(&args.trusted_root).and_then(|trust| {
+        supply_chain::verify_files(
+            &args.binary,
+            &args.blob_bundle,
+            &args.provenance,
+            &trust,
+            &policy,
+        )
+        .map_err(anyhow::Error::from)
+    });
+    match outcome {
+        Ok(v) => {
+            tracing::info!(digest = %v.digest_hex, identity = %v.san, "release verified");
+            println!("VERIFIED sha256:{} identity={}", v.digest_hex, v.san);
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "verification failed — refusing (fail closed)");
+            eprintln!("REFUSED: {e}");
+            Ok(ExitCode::from(EXIT_VERIFY_REFUSED))
+        }
+    }
+}
+
+fn run_update(args: UpdateArgs) -> anyhow::Result<ExitCode> {
+    let outcome = (|| -> anyhow::Result<supply_chain::VerifiedRelease> {
+        let updater = SelfUpdater::from_trust_root_file(&args.trusted_root)?;
+        let blob = Bundle::parse(&std::fs::read(&args.blob_bundle)?)?;
+        let prov = Bundle::parse(&std::fs::read(&args.provenance)?)?;
+        Ok(updater.install(&args.candidate, &blob, &prov, &args.install_to)?)
+    })();
+    match outcome {
+        Ok(v) => {
+            println!(
+                "INSTALLED sha256:{} -> {}",
+                v.digest_hex,
+                args.install_to.display()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "update refused — not installing (fail closed)");
+            eprintln!("REFUSED update: {e}");
+            Ok(ExitCode::from(EXIT_VERIFY_REFUSED))
         }
     }
 }

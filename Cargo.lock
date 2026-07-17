@@ -2334,6 +2334,7 @@ name = "sessionlayer-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "fd-lock",
  "futures-util",
@@ -2351,6 +2352,7 @@ dependencies = [
  "seccompiler",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "testcontainers",
  "thiserror",
@@ -2364,6 +2366,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "x509-parser",
  "zeroize",
 ]
 

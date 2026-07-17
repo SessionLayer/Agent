@@ -41,8 +41,10 @@ pub mod mtls;
 pub mod privilege;
 mod secret;
 pub mod supervisor;
+pub mod supply_chain;
 pub mod telemetry;
 pub mod tls;
+pub mod update;
 pub mod version;
 
 /// Types + gRPC stubs generated from the vendored contract

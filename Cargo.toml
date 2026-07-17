@@ -80,6 +80,18 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # PEM parse/encode (bootstrap CA anchors, DER<->PEM for the tonic Identity).
 pem = "3"
 
+# Supply-chain verify-before-run (Part E / NFR-7). A node refuses to run/update
+# to an Agent binary that isn't Sigstore-verified against our release identity.
+# `x509-parser` (promoted from a dev-only rcgen feature to a real dep) parses the
+# Fulcio leaf and — via `verify` (ring backend, already in the tree) — checks the
+# leaf/intermediate signatures chain to the pinned Sigstore root; `sha2` digests
+# the candidate binary (bound to the provenance subject); `base64` decodes the
+# Sigstore-bundle fields. Raw ECDSA (blob/DSSE/Rekor-SET) reuses `p256`. No new
+# licenses (all RustCrypto MIT/Apache-2.0, already allow-listed) and no OpenSSL.
+x509-parser = { version = "0.18", features = ["verify"] }
+sha2 = "0.10"
+base64 = "0.22"
+
 # Single-writer data-dir lock (§8.2): an exclusive advisory lock so two Agent
 # processes can't race the credential / generation counter.
 fd-lock = "4"
