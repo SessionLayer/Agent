@@ -375,6 +375,17 @@ fn proof_to_proto(proof: JoinProof) -> enroll_agent_request::Proof {
 /// and persist-before-adopt the issued identity (generation 0).
 /// `bootstrap_trust_anchors_der` is the operator-pinned CP anchor used to verify
 /// the CP server certificate pre-enrollment.
+#[tracing::instrument(
+    name = "agent.enroll",
+    skip_all,
+    fields(
+        node_name = %node_name,
+        join_method = join.method_name(),
+        agent_id = tracing::field::Empty,
+        node_id = tracing::field::Empty,
+        generation = tracing::field::Empty,
+    )
+)]
 pub async fn enroll(
     store: &IdentityStore,
     params: &ChannelParams,
@@ -407,6 +418,12 @@ pub async fn enroll(
         });
     }
 
+    // Span correlation — issued IDs only, never the CSR/key/proof (OTEL §5).
+    let span = tracing::Span::current();
+    span.record("agent_id", tracing::field::display(&resp.agent_id));
+    span.record("node_id", tracing::field::display(&resp.node_id));
+    span.record("generation", resp.generation);
+
     store.persist_issued(IssuedCredential {
         agent_id: resp.agent_id,
         node_id: resp.node_id,
@@ -434,6 +451,15 @@ pub async fn enroll(
 /// (`RepairNeeded`) — fail closed to operator re-provision (FR-JOIN-2 makes that
 /// automatable), never silent corruption. The window is the response/persist gap
 /// only; see `RUNBOOK.md`.
+#[tracing::instrument(
+    name = "agent.renew",
+    skip_all,
+    fields(
+        node_name = %current.node_name,
+        from_generation = current.generation,
+        generation = tracing::field::Empty,
+    )
+)]
 pub async fn renew(
     store: &IdentityStore,
     params: &ChannelParams,
@@ -460,6 +486,7 @@ pub async fn renew(
             got: resp.generation,
         });
     }
+    tracing::Span::current().record("generation", resp.generation);
 
     store.persist_issued(IssuedCredential {
         agent_id: resp.agent_id,
