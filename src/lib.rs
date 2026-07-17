@@ -34,6 +34,7 @@
 
 pub mod config;
 pub mod gateway;
+pub mod hardening;
 pub mod identity;
 pub mod join;
 pub mod mtls;

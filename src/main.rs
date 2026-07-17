@@ -264,8 +264,11 @@ fn zipped(values: &[String], i: usize) -> Option<&String> {
     }
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> anyhow::Result<ExitCode> {
+/// Startup order is security-load-bearing. The Agent is deliberately **not** a
+/// `#[tokio::main]` binary: Tier-0 hardening (Landlock + seccomp) must be applied
+/// while the process is single-threaded so every tokio worker inherits it (Landlock
+/// has no TSYNC), so the multi-thread runtime is built by hand **after** hardening.
+fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
 
     // `--version-json` is a pure query: no logging side effects, no init.
@@ -276,7 +279,10 @@ async fn main() -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    telemetry::init(cli.log.as_deref());
+    // Early, before hardening, so startup logs (incl. the root refusal + the
+    // hardening report) are captured. The optional OTLP exporter runs on its own
+    // runtime held by this guard (telemetry::init).
+    let _telemetry = telemetry::init(cli.log.as_deref());
 
     // Fail closed if the single explicit TLS backend cannot be installed.
     init_process().context("process initialisation")?;
@@ -290,10 +296,24 @@ async fn main() -> anyhow::Result<ExitCode> {
             let once = args.once;
             // Built (and loopback-validated) BEFORE any credential work, so a bad
             // splice target or too-few diverse channels fails startup closed rather
-            // than after enrolling.
+            // than after enrolling. Also gives hardening the concrete paths/ports.
             let gateway = args.gateway_config()?;
             let config = args.into_config()?;
-            run(config, gateway, once).await
+
+            // Tier-0 hardening (Landlock + seccomp + coredump), fail-closed, while
+            // still single-threaded — every worker of the runtime built below
+            // inherits it. The OTLP collector (if any) is permitted egress.
+            let otlp_port = telemetry::otlp_endpoint()
+                .as_deref()
+                .and_then(hardening::otlp_port);
+            hardening::apply(&config, &gateway, otlp_port)
+                .context("applying Tier-0 runtime hardening")?;
+
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("building the tokio runtime")?;
+            runtime.block_on(run(config, gateway, once))
         }
         None => {
             let info = version::component_info();
