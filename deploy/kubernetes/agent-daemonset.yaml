@@ -1,0 +1,97 @@
+# SessionLayer Agent — reference DaemonSet with the Tier-0 container posture
+# (Part A / NFR-5 / Design §15). One Agent per node; the Agent dials OUT, so the
+# node needs no inbound reachability.
+#
+# The Agent ALSO applies seccomp + Landlock + coredump hardening in-process and
+# fails closed; this manifest is the structural half (defence in depth):
+#   - runAsNonRoot / uid 65532        — a root Agent could read the node host key
+#   - readOnlyRootFilesystem: true    — no rootfs writes; only the data-dir volume
+#   - allowPrivilegeEscalation: false + capabilities drop ALL + no_new_privs
+#   - seccompProfile RuntimeDefault   — a kernel seccomp floor under the in-process
+#                                        allow-list (the app narrows it further)
+#
+# Egress is limited to the CP identity plane, the node's diverse Gateways, and the
+# loopback splice to the node's own sshd — enforce it at the network layer too
+# (a NetworkPolicy / CNI egress rule) to match the in-process Landlock egress.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sessionlayer-agent
+  namespace: sessionlayer
+  labels:
+    app.kubernetes.io/name: sessionlayer-agent
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sessionlayer-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sessionlayer-agent
+    spec:
+      # Host-key access is root-only on the node; the Agent must never be root.
+      hostPID: false
+      automountServiceAccountToken: true # OIDC join reads the projected SA token
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent
+          image: ghcr.io/sessionlayer/agent:latest # pin by digest in production
+          args:
+            - run
+            - --node-name=$(NODE_NAME)
+            - --join-method=oidc
+            - --join-token-file=/var/run/secrets/sessionlayer/token
+            - --cp-endpoint=https://controlplane.sessionlayer.svc:9443
+            - --cp-server-name=controlplane
+            - --bootstrap-ca-file=/etc/sessionlayer/ca.pem
+            - --data-dir=/var/lib/sessionlayer-agent
+            - --gateway-endpoint=wss://gw-a.sessionlayer:8443
+            - --gateway-endpoint=wss://gw-b.sessionlayer:8443
+            - --gateway-failure-domain=az-a
+            - --gateway-failure-domain=az-b
+            - --min-control-channels=2
+            - --splice-addr=127.0.0.1:22
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # OpenTelemetry is OFF unless this is set (OTEL-CONTRACT §6):
+            # - name: OTEL_EXPORTER_OTLP_ENDPOINT
+            #   value: https://otel-collector.observability:4317
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # The ONLY writable path (matches the in-process Landlock RW rule).
+            - name: data
+              mountPath: /var/lib/sessionlayer-agent
+            - name: bootstrap-ca
+              mountPath: /etc/sessionlayer
+              readOnly: true
+            - name: join-token
+              mountPath: /var/run/secrets/sessionlayer
+              readOnly: true
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: bootstrap-ca
+          configMap:
+            name: sessionlayer-bootstrap-ca
+        - name: join-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: sessionlayer-controlplane
+                  expirationSeconds: 3600
