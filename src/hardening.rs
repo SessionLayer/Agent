@@ -182,6 +182,27 @@ pub fn apply(
 #[cfg(target_os = "linux")]
 mod imp;
 
+/// Test-only seam so a forked child can install the exact production seccomp
+/// allow-list — compiled in the parent (allocates) and applied in the child (no
+/// allocation → fork-safe) — to prove a disallowed syscall is KILLED
+/// (`SECCOMP_RET_KILL_PROCESS`). Not for production use; real hardening goes
+/// through [`apply`].
+#[doc(hidden)]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub mod testing {
+    /// Compile the production seccomp program (parent side).
+    pub fn compile_seccomp() -> anyhow::Result<seccompiler::BpfProgram> {
+        super::imp::compile_seccomp().map(|(program, _count)| program)
+    }
+    /// Install a compiled program on the caller's thread group (child side).
+    pub fn apply_seccomp(program: &seccompiler::BpfProgram) -> anyhow::Result<()> {
+        super::imp::apply_seccomp(program)
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn apply_impl(plan: &HardeningPlan) -> anyhow::Result<Report> {
     imp::apply(plan)
@@ -280,9 +301,14 @@ mod tests {
         let config = base_config("/data", "https://cp:443", join);
         let gateway = gw("127.0.0.1:22", &["wss://gw:443"]);
         let plan = HardeningPlan::derive(&config, &gateway, None);
-        assert!(plan.allowed_connect_ports.contains(&22), "splice port must be allowed");
+        assert!(
+            plan.allowed_connect_ports.contains(&22),
+            "splice port must be allowed"
+        );
         // The join-token file is read-only material Landlock must permit.
-        assert!(plan.read_only_paths.contains(&PathBuf::from("/run/secrets/join")));
+        assert!(plan
+            .read_only_paths
+            .contains(&PathBuf::from("/run/secrets/join")));
     }
 
     #[test]
@@ -294,7 +320,11 @@ mod tests {
         let config = base_config("/data", "https://cp:9443", join);
         let plan = HardeningPlan::derive(&config, &None, None);
         assert_eq!(plan.allowed_connect_ports, vec![9443]);
-        assert!(plan.read_only_paths.contains(&PathBuf::from("/etc/sl/op.crt")));
-        assert!(plan.read_only_paths.contains(&PathBuf::from("/etc/sl/op.key")));
+        assert!(plan
+            .read_only_paths
+            .contains(&PathBuf::from("/etc/sl/op.crt")));
+        assert!(plan
+            .read_only_paths
+            .contains(&PathBuf::from("/etc/sl/op.key")));
     }
 }

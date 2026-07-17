@@ -148,6 +148,9 @@ testcontainers = "0.27"
 # the production build (no dev-deps) stays lean (no x509-parser edge). Mirrors
 # the Gateway.
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }
+# fork/waitpid/WTERMSIG for the seccomp-enforcement test (a disallowed syscall in a
+# forked child must be KILLED). libc is already a runtime dep on unix.
+libc = "0.2"
 
 [profile.release]
 # Reproducible-build / provenance intent (NFR-7): deterministic, debuginfo-free

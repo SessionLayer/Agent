@@ -165,7 +165,10 @@ async fn no_secret_reaches_any_span_log_or_attribute() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let captured = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
-    assert!(!captured.is_empty(), "the capturing subscriber recorded nothing");
+    assert!(
+        !captured.is_empty(),
+        "the capturing subscriber recorded nothing"
+    );
 
     // Correlation IS present.
     assert!(

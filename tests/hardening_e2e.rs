@@ -53,7 +53,10 @@ fn hardening_is_applied_and_logged_before_any_credential_work() {
         "--once",
     ]);
 
-    assert!(!ok, "must fail (bad CA / unreachable CP) after hardening; log:\n{log}");
+    assert!(
+        !ok,
+        "must fail (bad CA / unreachable CP) after hardening; log:\n{log}"
+    );
     assert!(
         log.contains("Tier-0 runtime hardening applied"),
         "hardening must be applied and logged BEFORE credential work — not skipped; log:\n{log}"

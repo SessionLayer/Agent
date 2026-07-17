@@ -200,6 +200,12 @@ async fn agent_splices_a_real_ssh_session_into_the_nodes_own_sshd() {
         &format!("TRUSTED_USER_CA={}", trusted_user_ca.trim()),
         "-e",
         &format!("SSHD_PORT={sshd_port}"),
+        // Enable the OTLP exporter so the hardened run also exercises the export
+        // path's syscalls under seccomp (no collector listens → the exporter's
+        // connect attempts to 4317 are harmless; 4317 is auto-added to the egress
+        // allow-list). Proves the KILL-default allow-list covers OTLP-on too.
+        "-e",
+        "OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317",
         "-v",
         &format!("{AGENT_BIN}:/agent:ro"),
         "-v",

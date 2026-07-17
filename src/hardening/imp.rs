@@ -129,9 +129,17 @@ fn apply_landlock(plan: &HardeningPlan) -> anyhow::Result<Landlock> {
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn install_seccomp() -> anyhow::Result<usize> {
-    use seccompiler::{
-        apply_filter_all_threads, BpfProgram, SeccompAction, SeccompFilter, SeccompRule,
-    };
+    let (program, count) = compile_seccomp()?;
+    apply_seccomp(&program)?;
+    Ok(count)
+}
+
+/// Compile the production seccomp program (allow-list → BPF). Split from
+/// [`apply_seccomp`] so a fork-based test can build it in the parent (this
+/// allocates) and install it in the child (no allocation → fork-safe).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(super) fn compile_seccomp() -> anyhow::Result<(seccompiler::BpfProgram, usize)> {
+    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule};
 
     let syscalls = allowed_syscalls();
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
@@ -139,7 +147,6 @@ fn install_seccomp() -> anyhow::Result<usize> {
         // An empty rule set means "match unconditionally" → the match action (Allow).
         rules.insert(*sc, vec![]);
     }
-
     let filter = SeccompFilter::new(
         rules,
         SeccompAction::KillProcess, // any syscall off the allow-list kills the process
@@ -147,8 +154,13 @@ fn install_seccomp() -> anyhow::Result<usize> {
         target_arch(),
     )?;
     let bpf: BpfProgram = filter.try_into()?;
-    apply_filter_all_threads(&bpf)?;
-    Ok(syscalls.len())
+    Ok((bpf, syscalls.len()))
+}
+
+/// Install a compiled seccomp program on every thread of the process (TSYNC).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(super) fn apply_seccomp(program: &seccompiler::BpfProgram) -> anyhow::Result<()> {
+    seccompiler::apply_filter_all_threads(program).map_err(anyhow::Error::from)
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]

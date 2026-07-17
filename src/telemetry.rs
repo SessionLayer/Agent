@@ -101,8 +101,11 @@ type OtelLayer = tracing_opentelemetry::OpenTelemetryLayer<
 /// gRPC channel binds to, or `None` when the exporter is disabled or cannot be
 /// built. A build failure degrades to local-only logging (a missing collector must
 /// never stop the Agent) — it is logged, not fatal.
-fn otlp_pipeline() -> Option<(OtelLayer, opentelemetry_sdk::trace::SdkTracerProvider, tokio::runtime::Runtime)>
-{
+fn otlp_pipeline() -> Option<(
+    OtelLayer,
+    opentelemetry_sdk::trace::SdkTracerProvider,
+    tokio::runtime::Runtime,
+)> {
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_otlp::WithExportConfig;
 
