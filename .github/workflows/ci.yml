@@ -42,7 +42,7 @@ jobs:
         uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
 
       - name: Install cargo-nextest, cargo-deny, cargo-audit (pinned)
-        uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2.83.0
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
           # Pin the supply-chain enforcers themselves so the gate is reproducible
           # (NFR-7) — bump via reviewed PRs, matching the toolchain/action pins.
