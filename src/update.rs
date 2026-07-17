@@ -1,9 +1,10 @@
-//! Verify-before-run/update (NFR-7, the runtime control). The Agent will only
-//! run or install to a binary whose Sigstore signature + provenance + identity
-//! verify against the pinned release identity. Both entry points **verify first
-//! and fail closed**: [`SelfUpdater::run`] launches a candidate only after it
-//! verifies; [`SelfUpdater::install`] never writes an unverified candidate into
-//! place. The launch step is injected so the boundary is directly testable.
+//! Verify-before-update (NFR-7, the runtime control): [`SelfUpdater::install`]
+//! verifies a candidate's Sigstore signature + provenance + identity against the
+//! pinned release identity, enforces anti-rollback, and **only then** atomically
+//! installs the *verified bytes* (never a re-read of the candidate path — no
+//! TOCTOU) — an unverified or downgrade candidate is never written into place,
+//! fail closed. Verify-before-RUN is the daemon's `--verify-self` startup check
+//! (see `main.rs`).
 
 use std::path::{Path, PathBuf};
 
@@ -27,46 +28,29 @@ pub enum UpdateError {
         #[source]
         source: std::io::Error,
     },
-    #[error("launching verified binary: {0}")]
-    Launch(#[source] std::io::Error),
-}
-
-/// How a verified binary is executed. Abstracted so the "never launch an
-/// unverified binary" boundary can be asserted without exec-ing in tests.
-pub trait Launcher {
-    /// Launch `binary`. The real impl `execv`s and so only returns on failure.
-    fn launch(&self, binary: &Path) -> std::io::Result<()>;
-}
-
-/// Production launcher: replace this process image with the verified binary.
-pub struct ExecLauncher {
-    pub args: Vec<std::ffi::OsString>,
-}
-
-impl Launcher for ExecLauncher {
-    #[cfg(unix)]
-    fn launch(&self, binary: &Path) -> std::io::Result<()> {
-        use std::os::unix::process::CommandExt;
-        // `exec` only returns if it FAILED; on success the image is replaced.
-        Err(std::process::Command::new(binary).args(&self.args).exec())
-    }
-    #[cfg(not(unix))]
-    fn launch(&self, binary: &Path) -> std::io::Result<()> {
-        let status = std::process::Command::new(binary)
-            .args(&self.args)
-            .status()?;
-        std::process::exit(status.code().unwrap_or(1));
-    }
+    /// A validly-signed but OLDER (or unparseable-version) release — refused so a
+    /// signed downgrade to a known-vulnerable build can't be forced.
+    #[error("refusing downgrade: candidate {candidate} is not newer than current {current} (pass --allow-downgrade to override)")]
+    Downgrade { candidate: String, current: String },
 }
 
 pub struct SelfUpdater {
     trust: TrustRoot,
     policy: VerificationPolicy,
+    /// Anti-rollback floor: refuse a candidate whose release version is not
+    /// strictly newer. `None` = no floor (the stateless `verify` path).
+    min_version: Option<semver::Version>,
+    allow_downgrade: bool,
 }
 
 impl SelfUpdater {
     pub fn new(trust: TrustRoot, policy: VerificationPolicy) -> Self {
-        Self { trust, policy }
+        Self {
+            trust,
+            policy,
+            min_version: None,
+            allow_downgrade: false,
+        }
     }
 
     /// Load the pinned Sigstore trust root from an operator-supplied
@@ -80,6 +64,25 @@ impl SelfUpdater {
         Ok(Self::new(trust, VerificationPolicy::sessionlayer_agent()))
     }
 
+    /// Refuse installing/running a candidate whose version is not strictly newer
+    /// than `floor` (unless `allow_downgrade`). `floor` is the running agent's
+    /// own version.
+    pub fn with_rollback_floor(
+        mut self,
+        floor: &str,
+        allow_downgrade: bool,
+    ) -> Result<Self, UpdateError> {
+        self.min_version =
+            Some(
+                semver::Version::parse(floor).map_err(|e| UpdateError::Downgrade {
+                    candidate: "?".into(),
+                    current: format!("{floor} (unparseable: {e})"),
+                })?,
+            );
+        self.allow_downgrade = allow_downgrade;
+        Ok(self)
+    }
+
     pub fn verify(
         &self,
         binary: &[u8],
@@ -89,23 +92,34 @@ impl SelfUpdater {
         supply_chain::verify_binary(binary, blob, provenance, &self.policy, &self.trust)
     }
 
-    /// Verify `candidate` and, only on success, launch it (fail closed).
-    pub fn run<L: Launcher>(
-        &self,
-        candidate: &Path,
-        blob: &Bundle,
-        provenance: &Bundle,
-        launcher: &L,
-    ) -> Result<VerifiedRelease, UpdateError> {
-        let bytes = read_candidate(candidate)?;
-        let verified = self.verify(&bytes, blob, provenance)?;
-        tracing::info!(digest = %verified.digest_hex, "candidate verified — launching");
-        launcher.launch(candidate).map_err(UpdateError::Launch)?;
-        Ok(verified)
+    /// Anti-rollback (fail closed): with a floor set, the candidate's
+    /// signature-authenticated version must parse and be >= the floor.
+    fn check_rollback(&self, verified: &VerifiedRelease) -> Result<(), UpdateError> {
+        let Some(min) = &self.min_version else {
+            return Ok(());
+        };
+        if self.allow_downgrade {
+            return Ok(());
+        }
+        let current = min.to_string();
+        let raw = verified.version.as_deref().unwrap_or("");
+        match semver::Version::parse(raw) {
+            Ok(cand) if &cand >= min => Ok(()),
+            _ => Err(UpdateError::Downgrade {
+                candidate: if raw.is_empty() {
+                    "<none>".into()
+                } else {
+                    raw.into()
+                },
+                current,
+            }),
+        }
     }
 
     /// Verify `candidate` and, only on success, atomically install it to
-    /// `install_to`. An unverified candidate is **never** written into place.
+    /// `install_to`. The bytes written are the **exact bytes that were verified**
+    /// — never a re-read of `candidate` — so there is no verify-then-swap (TOCTOU)
+    /// window, and an unverified candidate is **never** written into place.
     pub fn install(
         &self,
         candidate: &Path,
@@ -115,7 +129,8 @@ impl SelfUpdater {
     ) -> Result<VerifiedRelease, UpdateError> {
         let bytes = read_candidate(candidate)?;
         let verified = self.verify(&bytes, blob, provenance)?;
-        atomic_replace(candidate, install_to).map_err(|source| UpdateError::Install {
+        self.check_rollback(&verified)?;
+        atomic_write(&bytes, install_to).map_err(|source| UpdateError::Install {
             path: install_to.display().to_string(),
             source,
         })?;
@@ -131,28 +146,37 @@ fn read_candidate(path: &Path) -> Result<Vec<u8>, UpdateError> {
     })
 }
 
-/// Copy `candidate` into a temp file in the destination directory, make it
-/// executable, then rename over `install_to` (atomic on the same filesystem).
-fn atomic_replace(candidate: &Path, install_to: &Path) -> std::io::Result<()> {
-    let dir = install_to.parent().filter(|p| !p.as_os_str().is_empty());
-    let dir = dir.unwrap_or_else(|| Path::new("."));
+/// Write the already-verified `bytes` to a fresh, exclusive temp file in the
+/// destination directory, make it executable, then rename over `install_to`
+/// (atomic on the same filesystem). Writing the verified buffer — rather than
+/// copying from the candidate path — is what closes the TOCTOU window. The temp
+/// is removed on any failure so a partial write never litters the bin dir.
+fn atomic_write(bytes: &[u8], install_to: &Path) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let dir = install_to
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let name = install_to
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "agent".into());
     let tmp: PathBuf = dir.join(format!(".{name}.{}.new", std::process::id()));
 
-    std::fs::copy(candidate, &tmp)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
-    }
-    match std::fs::rename(&tmp, install_to) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
+    let write = || -> std::io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true); // O_EXCL: never reuse an attacker-planted temp
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o755);
         }
-    }
+        let mut f = opts.open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, install_to)
+    };
+    write().inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }

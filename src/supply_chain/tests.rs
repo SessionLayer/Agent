@@ -279,6 +279,47 @@ fn accepts_valid_release() {
     assert_eq!(ok.san, SAN_OK);
     assert_eq!(ok.source_repo, REPO);
     assert_eq!(ok.digest_hex, to_hex(&Sha256::digest(&f.binary)));
+    // The version rides on the identity-pinned SAN tag ref (anti-rollback input).
+    assert_eq!(ok.version.as_deref(), Some("1.2.3"));
+}
+
+// --- Anti-rollback: a validly-signed OLDER release is refused (F-DIV-1).
+
+#[test]
+fn refuses_signed_downgrade() {
+    let f = build(Params::default()); // release v1.2.3
+    let updater = crate::update::SelfUpdater::new(f.trust.clone(), f.policy.clone())
+        .with_rollback_floor("2.0.0", false)
+        .unwrap();
+    let blob = f.blob_bundle(&f.binary);
+    let prov = f.prov_bundle(&f.binary);
+    let tmp = tempfile::tempdir().unwrap();
+    let cand = tmp.path().join("candidate");
+    let live = tmp.path().join("live");
+    std::fs::write(&cand, &f.binary).unwrap();
+    std::fs::write(&live, b"CURRENT-2.0.0").unwrap();
+
+    let err = updater.install(&cand, &blob, &prov, &live).unwrap_err();
+    assert!(
+        matches!(err, crate::update::UpdateError::Downgrade { .. }),
+        "got {err:?}"
+    );
+    assert_eq!(std::fs::read(&live).unwrap(), b"CURRENT-2.0.0"); // not overwritten
+
+    // Same signed release is accepted when it is an UPGRADE over the floor.
+    let up = crate::update::SelfUpdater::new(f.trust.clone(), f.policy.clone())
+        .with_rollback_floor("1.0.0", false)
+        .unwrap();
+    up.install(&cand, &blob, &prov, &live).unwrap();
+    assert_eq!(std::fs::read(&live).unwrap(), f.binary);
+
+    // And the downgrade is permitted only with the explicit override.
+    std::fs::write(&live, b"CURRENT-2.0.0").unwrap();
+    let forced = crate::update::SelfUpdater::new(f.trust.clone(), f.policy.clone())
+        .with_rollback_floor("2.0.0", true)
+        .unwrap();
+    forced.install(&cand, &blob, &prov, &live).unwrap();
+    assert_eq!(std::fs::read(&live).unwrap(), f.binary);
 }
 
 #[test]
@@ -394,53 +435,7 @@ impl Fixture {
     }
 }
 
-// --- The run/update boundary: an unverified binary is never launched/installed.
-
-use std::cell::RefCell;
-use std::path::{Path, PathBuf};
-
-struct SpyLauncher {
-    launched: RefCell<Option<PathBuf>>,
-}
-impl crate::update::Launcher for SpyLauncher {
-    fn launch(&self, binary: &Path) -> std::io::Result<()> {
-        *self.launched.borrow_mut() = Some(binary.to_path_buf());
-        Ok(())
-    }
-}
-
-#[test]
-fn run_launches_only_a_verified_binary() {
-    let f = build(Params::default());
-    let updater = crate::update::SelfUpdater::new(f.trust.clone(), f.policy.clone());
-    let blob = f.blob_bundle(&f.binary);
-    let prov = f.prov_bundle(&f.binary);
-
-    let tmp = tempfile::tempdir().unwrap();
-    let cand = tmp.path().join("candidate");
-
-    std::fs::write(&cand, &f.binary).unwrap();
-    let spy = SpyLauncher {
-        launched: RefCell::new(None),
-    };
-    updater.run(&cand, &blob, &prov, &spy).unwrap();
-    assert_eq!(spy.launched.into_inner().as_deref(), Some(cand.as_path()));
-
-    // A tampered candidate on disk (bundles unchanged) must be refused, unlaunched.
-    std::fs::write(&cand, b"tampered").unwrap();
-    let spy = SpyLauncher {
-        launched: RefCell::new(None),
-    };
-    let err = updater.run(&cand, &blob, &prov, &spy).unwrap_err();
-    assert!(
-        matches!(err, crate::update::UpdateError::Verify(_)),
-        "got {err:?}"
-    );
-    assert!(
-        spy.launched.into_inner().is_none(),
-        "must not launch an unverified binary"
-    );
-}
+// --- The update boundary: an unverified binary is never installed.
 
 #[test]
 fn install_never_writes_an_unverified_binary() {

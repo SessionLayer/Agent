@@ -134,18 +134,16 @@ impl Bundle {
     }
 
     pub fn tlog_entry(&self) -> Result<&TlogEntry, VerifyError> {
-        // Exactly-one transparency entry is required (fail closed): a bundle with
-        // no Rekor entry cannot be checked for inclusion, so we refuse it.
-        match self.verification_material.tlog_entries.as_slice() {
-            [entry] => Ok(entry),
-            [] => Err(VerifyError::Transparency(
-                "bundle carries no Rekor transparency-log entry".into(),
-            )),
-            many => Err(VerifyError::Transparency(format!(
-                "expected exactly one Rekor entry, found {}",
-                many.len()
-            ))),
-        }
+        // At least one transparency entry is required (fail closed): a bundle with
+        // no Rekor entry can't be checked for inclusion. We verify the first — its
+        // SET must verify AND its body must bind the artifact digest, so extra
+        // entries (e.g. during a Rekor v1→v2 dual-log window) can't weaken it.
+        self.verification_material
+            .tlog_entries
+            .first()
+            .ok_or_else(|| {
+                VerifyError::Transparency("bundle carries no Rekor transparency-log entry".into())
+            })
     }
 }
 

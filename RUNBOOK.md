@@ -47,7 +47,15 @@ sessionlayer-agent verify \
 sessionlayer-agent update \
   --candidate ./sessionlayer-agent.new --install-to /usr/local/bin/sessionlayer-agent \
   --blob-bundle ... --provenance ... --trusted-root ...
-# verifies first; an unverified candidate is NEVER written into place (fail closed)
+# verifies first; an unverified candidate is NEVER written into place (fail closed).
+# ANTI-ROLLBACK: a validly-signed but OLDER release is refused (its version, taken
+# from the signed SAN tag, must be >= this agent's version). Force with
+# --allow-downgrade only for a deliberate, audited rollback.
+
+# Verify-before-RUN: have the daemon prove its OWN binary at startup, fail closed:
+sessionlayer-agent run --node-name n1 --bootstrap-ca-file ca.pem \
+  --verify-self --self-blob-bundle ...cosign.sigstore.json \
+  --self-provenance ...provenance.sigstore.json --self-trusted-root trusted_root.json
 ```
 
 The trusted identity (compiled default; override for a private Sigstore with
@@ -56,6 +64,27 @@ The trusted identity (compiled default; override for a private Sigstore with
 `github.com/SessionLayer/Agent`. A signed-but-wrong-identity, wrong-workflow, or
 tampered binary is refused. Independent cross-check: `gh attestation verify
 sessionlayer-agent --repo SessionLayer/Agent`.
+
+### Trust-root rotation & staleness (operability)
+
+`trusted_root.json` is **operator-supplied and pinned by digest** — the tool
+does not fetch or auto-refresh it (offline by design). Sigstore rotates its
+Fulcio intermediate and Rekor keys periodically; the TUF-distributed
+`trusted_root.json` carries the current + prior material.
+
+- **Refresh cadence:** re-fetch `trusted_root.json` from `tuf-repo-cdn.sigstore.dev`
+  (or `cosign trusted-root create`) and re-pin its digest on your normal config
+  cadence (at least quarterly, and whenever Sigstore announces a root rotation).
+- **Symptom — verification fails *fleet-wide* right after a Sigstore rotation:**
+  `verify`/`update` refuse with a chain error (`certificate chain does not verify
+  to the pinned Sigstore root`) because leaves are now issued under an
+  intermediate your pinned root predates. **This is fail-closed and expected.**
+  Response: refresh + re-pin `trusted_root.json`, redeploy; do **not** disable
+  verification. A single node failing = its file is corrupt/missing; the whole
+  fleet failing at once = a stale trust root.
+- The tool trusts every CA/tlog key present in the file (it does not itself
+  enforce `validFor` windows), so **the digest-pin is the control** — only ship a
+  `trusted_root.json` you fetched from the authentic TUF root.
 
 ## Alert: log `SECURITY: generation mismatch on renewal ... auto-locked` (exit 3)
 Cause: two live copies of the credential forked the generation counter (a clone),

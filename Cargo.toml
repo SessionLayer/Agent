@@ -91,6 +91,11 @@ pem = "3"
 x509-parser = { version = "0.18", features = ["verify"] }
 sha2 = "0.10"
 base64 = "0.22"
+# Anti-rollback (downgrade protection) for the update path: compare the candidate
+# release's SemVer — extracted from the identity-pinned, Fulcio-signed SAN tag ref
+# — against the running version, so a validly-signed *older* (vulnerable) release
+# can't be forced. MIT/Apache-2.0, already allow-listed.
+semver = "1"
 
 # Single-writer data-dir lock (§8.2): an exclusive advisory lock so two Agent
 # processes can't race the credential / generation counter.

@@ -35,14 +35,20 @@ impl TrustRoot {
             ));
         }
 
+        // A tlog key we can't use (a future ed25519/RSA log key, or Rekor v2) is
+        // skipped, not fatal — we only need the P-256 Rekor keys we can verify.
+        // Failing the whole load on the first odd key would brick verification.
         let mut rekor_keys = Vec::new();
         for tlog in &tr.tlogs {
-            let der = decode_b64(&tlog.public_key.raw_bytes)?;
-            rekor_keys.push(verifying_key_from_spki(&der)?);
+            if let Ok(k) =
+                decode_b64(&tlog.public_key.raw_bytes).and_then(|d| verifying_key_from_spki(&d))
+            {
+                rekor_keys.push(k);
+            }
         }
         if rekor_keys.is_empty() {
             return Err(VerifyError::TrustAnchor(
-                "trusted_root.json has no Rekor tlog keys".into(),
+                "trusted_root.json has no usable P-256 Rekor tlog keys".into(),
             ));
         }
 

@@ -163,7 +163,9 @@ fn der_utf8string(v: &[u8]) -> Option<String> {
         return None;
     }
     let (len, hdr) = der_len(&v[1..])?;
-    let body = v.get(1 + hdr..1 + hdr + len)?;
+    let start = 1usize.checked_add(hdr)?;
+    let end = start.checked_add(len)?;
+    let body = v.get(start..end)?;
     std::str::from_utf8(body).ok().map(|s| s.to_string())
 }
 

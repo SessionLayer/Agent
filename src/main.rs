@@ -60,6 +60,10 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+// The CLI is parsed exactly once at startup, so the size gap between the large
+// `Run` variant and the small verify/update ones is irrelevant (and boxing
+// fights the clap derive).
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Join the platform and maintain the renewable mTLS identity.
     Run(RunArgs),
@@ -127,6 +131,13 @@ struct UpdateArgs {
     /// Where the verified binary is atomically installed.
     #[arg(long)]
     install_to: PathBuf,
+    /// Anti-rollback floor (default: this running Agent's version). A candidate
+    /// must be >= this or the update is refused.
+    #[arg(long)]
+    current_version: Option<String>,
+    /// Permit installing an older/equal signed release (disables anti-rollback).
+    #[arg(long)]
+    allow_downgrade: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -216,6 +227,21 @@ struct RunArgs {
     /// this for regulated deploys that must not run with degraded confinement.
     #[arg(long)]
     require_full_landlock: bool,
+
+    /// Verify-before-RUN (NFR-7): at startup, verify THIS binary's Sigstore
+    /// signature + SLSA provenance + release identity against the pinned trust
+    /// root, and refuse to run if it fails. Requires the three paths below.
+    #[arg(long, requires_all = ["self_blob_bundle", "self_provenance", "self_trusted_root"])]
+    verify_self: bool,
+    /// The cosign blob-signature bundle for this binary (with `--verify-self`).
+    #[arg(long)]
+    self_blob_bundle: Option<PathBuf>,
+    /// The SLSA provenance bundle for this binary (with `--verify-self`).
+    #[arg(long)]
+    self_provenance: Option<PathBuf>,
+    /// The pinned Sigstore `trusted_root.json` (with `--verify-self`).
+    #[arg(long)]
+    self_trusted_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -369,6 +395,12 @@ fn main() -> anyhow::Result<ExitCode> {
             // impersonate it. `verify`/`update` load no credentials, so the refusal
             // is scoped to the credential-bearing run path.
             privilege::require_non_root()?;
+            // Verify-before-RUN (NFR-7): prove THIS binary is a signed
+            // SessionLayer/Agent release before doing any credential/data work.
+            // Runs before hardening so it can read /proc/self/exe + the bundles.
+            if args.verify_self {
+                verify_self(&args)?;
+            }
             let once = args.once;
             let require_full_landlock = args.require_full_landlock;
             // Built (and loopback-validated) BEFORE any credential work, so a bad
@@ -425,6 +457,30 @@ fn load_trust(path: &std::path::Path) -> anyhow::Result<TrustRoot> {
     Ok(TrustRoot::from_trusted_root_json(&bytes)?)
 }
 
+/// Verify-before-RUN: verify this process's own executable against the pinned
+/// trust root, fail closed. clap's `requires_all` guarantees the three paths.
+fn verify_self(args: &RunArgs) -> anyhow::Result<()> {
+    let blob = args.self_blob_bundle.as_ref().expect("clap requires it");
+    let prov = args.self_provenance.as_ref().expect("clap requires it");
+    let root = args.self_trusted_root.as_ref().expect("clap requires it");
+    let exe = std::env::current_exe().context("resolving current executable for --verify-self")?;
+    let trust = load_trust(root)?;
+    let policy = VerificationPolicy::sessionlayer_agent();
+    match supply_chain::verify_files(&exe, blob, prov, &trust, &policy) {
+        Ok(v) => {
+            tracing::info!(
+                digest = %v.digest_hex,
+                version = v.version.as_deref().unwrap_or("?"),
+                "self-verification passed — running a verified binary"
+            );
+            Ok(())
+        }
+        Err(e) => anyhow::bail!(
+            "self-verification failed — refusing to run (NFR-7 verify-before-run): {e}"
+        ),
+    }
+}
+
 fn run_verify(args: VerifyArgs) -> anyhow::Result<ExitCode> {
     let policy = args.policy();
     let outcome = load_trust(&args.trusted_root).and_then(|trust| {
@@ -453,7 +509,12 @@ fn run_verify(args: VerifyArgs) -> anyhow::Result<ExitCode> {
 
 fn run_update(args: UpdateArgs) -> anyhow::Result<ExitCode> {
     let outcome = (|| -> anyhow::Result<supply_chain::VerifiedRelease> {
-        let updater = SelfUpdater::from_trust_root_file(&args.trusted_root)?;
+        let floor = args
+            .current_version
+            .as_deref()
+            .unwrap_or(env!("CARGO_PKG_VERSION"));
+        let updater = SelfUpdater::from_trust_root_file(&args.trusted_root)?
+            .with_rollback_floor(floor, args.allow_downgrade)?;
         let blob = Bundle::parse(&std::fs::read(&args.blob_bundle)?)?;
         let prov = Bundle::parse(&std::fs::read(&args.provenance)?)?;
         Ok(updater.install(&args.candidate, &blob, &prov, &args.install_to)?)

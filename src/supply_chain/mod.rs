@@ -40,6 +40,10 @@ pub struct VerifiedRelease {
     pub digest_hex: String,
     pub san: String,
     pub source_repo: String,
+    /// The release version, taken from the identity-pinned SAN tag ref
+    /// (`…@refs/tags/v<VERSION>`) — i.e. it is authenticated by the same Fulcio
+    /// signature as the rest of the identity. Drives anti-rollback in `update`.
+    pub version: Option<String>,
 }
 
 /// Verify a candidate binary against its provenance + blob-signature bundles.
@@ -89,10 +93,19 @@ pub fn verify_binary(
     }
     rekor::require_body_binds(blob_entry, &digest_hex)?;
 
+    // The version is the SAN suffix after the pinned `…@refs/tags/v` prefix — it
+    // rides on the identity we just authenticated, so it is trustworthy input to
+    // the anti-rollback check (never taken from the binary/filename).
+    let san = prov_leaf.san.unwrap_or_default();
+    let version = san
+        .strip_prefix(&policy.workflow_ref_prefix)
+        .map(|v| v.to_string());
+
     Ok(VerifiedRelease {
         digest_hex,
-        san: prov_leaf.san.unwrap_or_default(),
+        san,
         source_repo: prov_leaf.source_repo.unwrap_or_default(),
+        version,
     })
 }
 
