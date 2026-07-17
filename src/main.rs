@@ -28,7 +28,9 @@ use sessionlayer_agent::config::{
 use sessionlayer_agent::gateway::GatewayClient;
 use sessionlayer_agent::identity::{self, IdentityStore, RenewAhead, RenewAheadConfig};
 use sessionlayer_agent::mtls::ChannelParams;
-use sessionlayer_agent::{init_process, privilege, supervisor, telemetry, version, LONG_VERSION};
+use sessionlayer_agent::{
+    hardening, init_process, privilege, supervisor, telemetry, version, LONG_VERSION,
+};
 
 /// Default Gateway enrolled name (dev; overridden in every real deploy).
 const DEFAULT_GATEWAY_SERVER_NAME: &str = "gateway";
