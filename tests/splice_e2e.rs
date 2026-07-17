@@ -200,6 +200,12 @@ async fn agent_splices_a_real_ssh_session_into_the_nodes_own_sshd() {
         &format!("TRUSTED_USER_CA={}", trusted_user_ca.trim()),
         "-e",
         &format!("SSHD_PORT={sshd_port}"),
+        // Enable the OTLP exporter so the hardened run also exercises the export
+        // path's syscalls under seccomp (no collector listens → the exporter's
+        // connect attempts to 4317 are harmless; 4317 is auto-added to the egress
+        // allow-list). Proves the KILL-default allow-list covers OTLP-on too.
+        "-e",
+        "OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317",
         "-v",
         &format!("{AGENT_BIN}:/agent:ro"),
         "-v",
@@ -287,6 +293,57 @@ async fn agent_splices_a_real_ssh_session_into_the_nodes_own_sshd() {
     assert!(
         out.contains("deploy"),
         "the session must land as the certificate's principal; got:\n{out}"
+    );
+
+    // Part A (S21): the whole splice above ran under the HARDENED binary — the real
+    // Agent applied seccomp + Landlock (+ coredump hygiene) before it built its
+    // runtime and enrolled, and a full certificate-authenticated SSH session still
+    // completed. Prove hardening actually ran (it must never silently skip).
+    assert!(
+        node.logs().contains("Tier-0 runtime hardening applied"),
+        "the Agent must apply Tier-0 hardening; the splice ran under it. node log:\n{}",
+        node.logs()
+    );
+
+    // Part A (S21): a SECOND session — a real SFTP/SCP file transfer — over the SAME
+    // hardened splice, proving file-transfer (not just exec) survives hardening. The
+    // Agent splices opaque ciphertext, so exec/shell/sftp share one code path and one
+    // syscall surface; this is belt-and-braces evidence for the KILL-default list.
+    let bridge2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bridge2_port = bridge2.local_addr().unwrap().port();
+    let mut req2 = gw.dial_back_request(NODE_NAME, token);
+    req2.request_id = "req-sftp".to_string();
+    gw.send_dial_back(req2).await;
+    let splice2 = gw.await_splice().await;
+    assert_eq!(splice2.token, token);
+    assert!(
+        gw.await_result().await.accepted,
+        "the SFTP dial-back must be accepted"
+    );
+    tokio::spawn(async move {
+        let (tcp, _) = bridge2.accept().await.expect("scp client connects");
+        splice2.bridge(tcp).await;
+    });
+
+    // scp uses the SFTP protocol by default in modern OpenSSH; the node's sshd has
+    // `Subsystem sftp internal-sftp`. Transfer a file and verify it landed.
+    let scp = format!(
+        "printf 'hardened-transfer-payload\\n' > /work/payload && \
+         scp -P {bridge2_port} -i /work/id -o CertificateFile=/work/id-cert.pub \
+         -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+         -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 \
+         /work/payload deploy@127.0.0.1:/tmp/sl-payload"
+    );
+    let (ok, out) = client.exec(&["sh", "-c", &scp]);
+    assert!(
+        ok,
+        "an SFTP/SCP transfer must complete over the hardened splice; scp said:\n{out}\n\nnode log:\n{}",
+        node.logs()
+    );
+    let (landed, content) = node.exec(&["cat", "/tmp/sl-payload"]);
+    assert!(
+        landed && content.contains("hardened-transfer-payload"),
+        "the transferred file must land on the node over the splice; got:\n{content}\nscp said:\n{out}"
     );
 
     // (2) FR-AUD-4: the node's OWN sshd log carries the certificate key-id. This

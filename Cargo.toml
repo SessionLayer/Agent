@@ -91,6 +91,19 @@ zeroize = { version = "1", features = ["zeroize_derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# OpenTelemetry tracing (Part C / §14, OTEL-CONTRACT §2.2). The Agent mints its own
+# `agent.dial_back` / `agent.splice` (+ enroll/renew) spans and correlates them to
+# the platform trace by the `sessionlayer.session_id` it already holds — it does NOT
+# touch the frozen wire/SLDB1 token. OFF by default: the OTLP exporter layer is only
+# installed when OTEL_EXPORTER_OTLP_ENDPOINT is set; otherwise only the local
+# `tracing`/fmt subscriber runs, unchanged. Export is OTLP/gRPC over tonic on the
+# *ring* TLS backend (`tls-ring`, never native-TLS) so the deny.toml OpenSSL ban
+# holds. Spans carry IDs/enums/durations only — never plaintext/keys/tokens (§5).
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace", "tls-ring"] }
+tracing-opentelemetry = "0.33"
+
 # Config manifest + machine-readable version descriptor.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -103,9 +116,20 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 
 # Effective-UID probe for the non-root fail-closed check (FR-CONN-6). libc is
-# already in the tree transitively via tokio.
+# already in the tree transitively via tokio. Also carries the prctl/setrlimit
+# constants the Tier-0 hardening uses (coredump disable).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Tier-0 runtime hardening (Part A / NFR-5 / Design §15) — Linux LSM features, and
+# the Agent ships only on Linux (distroless). `seccompiler` builds+installs the
+# seccomp-BPF syscall allow-list (pure Rust — no libseccomp C dependency, one fewer
+# non-Rust supply-chain input than libseccomp). `landlock` applies the filesystem +
+# network-egress rulesets. Both fail closed (a step that cannot apply aborts; a
+# kernel that lacks the LSM is a documented, loud Accepted-Risk degrade).
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "0.5"
+landlock = "0.4"
 
 [build-dependencies]
 # Contract codegen: prost/tonic types from the vendored protos. The AgentIdentity
@@ -124,6 +148,9 @@ testcontainers = "0.27"
 # the production build (no dev-deps) stays lean (no x509-parser edge). Mirrors
 # the Gateway.
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }
+# fork/waitpid/WTERMSIG for the seccomp-enforcement test (a disallowed syscall in a
+# forked child must be KILLED). libc is already a runtime dep on unix.
+libc = "0.2"
 
 [profile.release]
 # Reproducible-build / provenance intent (NFR-7): deterministic, debuginfo-free

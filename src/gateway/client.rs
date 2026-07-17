@@ -18,6 +18,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::tungstenite::Message;
+use tracing::Instrument;
 
 use crate::config::{GatewayConfig, GatewayEndpoint};
 use crate::gateway::transport::{self, GatewayWs, CONTROL_PATH};
@@ -443,6 +444,10 @@ impl ControlChannel {
         let cred = cred.clone();
         let out_tx = out_tx.clone();
         let version = negotiated.version;
+        // Correlate the Agent's spans to the platform trace by session_id only — the
+        // id it already holds, never the wire/token (OTEL-CONTRACT §2.2). Captured
+        // before `req` is moved into the dial-back.
+        let session_id = req.session_id.clone();
         tokio::spawn(async move {
             let _permit = permit; // released when the splice ends → the drain latch
             let request_id = req.request_id.clone();
@@ -452,7 +457,15 @@ impl ControlChannel {
             // not wait out its dial-back deadline to learn the node's sshd is down.
             // Readiness is proven by STREAM_OPEN on the dial-back connection, not by
             // this frame.
-            let live = match crate::gateway::splice::dial_back(&config, &cred, req).await {
+            let dial_span = tracing::info_span!(
+                "agent.dial_back",
+                sessionlayer.session_id = %session_id.escape_debug(),
+                request_id = %request_id.escape_debug(),
+            );
+            let live = match crate::gateway::splice::dial_back(&config, &cred, req)
+                .instrument(dial_span)
+                .await
+            {
                 Ok(live) => live,
                 Err((code, err)) => {
                     tracing::warn!(
@@ -486,7 +499,12 @@ impl ControlChannel {
                 ))
                 .await;
 
-            let reason = live.run().await;
+            let splice_span = tracing::info_span!(
+                "agent.splice",
+                sessionlayer.session_id = %session_id.escape_debug(),
+                request_id = %request_id.escape_debug(),
+            );
+            let reason = live.run().instrument(splice_span).await;
             tracing::info!(
                 request_id = %request_id.escape_debug(),
                 reason = ?reason,

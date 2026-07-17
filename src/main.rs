@@ -28,7 +28,9 @@ use sessionlayer_agent::config::{
 use sessionlayer_agent::gateway::GatewayClient;
 use sessionlayer_agent::identity::{self, IdentityStore, RenewAhead, RenewAheadConfig};
 use sessionlayer_agent::mtls::ChannelParams;
-use sessionlayer_agent::{init_process, privilege, supervisor, telemetry, version, LONG_VERSION};
+use sessionlayer_agent::{
+    hardening, init_process, privilege, supervisor, telemetry, version, LONG_VERSION,
+};
 
 /// Default Gateway enrolled name (dev; overridden in every real deploy).
 const DEFAULT_GATEWAY_SERVER_NAME: &str = "gateway";
@@ -141,6 +143,13 @@ struct RunArgs {
     /// Used by CI/E2E.
     #[arg(long)]
     once: bool,
+
+    /// Abort startup unless Landlock is **fully** enforced (fail-closed for the
+    /// filesystem + network-egress confinement). The default accepts a documented
+    /// degrade on kernels lacking Landlock or its network ABI (Linux <6.7); set
+    /// this for regulated deploys that must not run with degraded confinement.
+    #[arg(long)]
+    require_full_landlock: bool,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -264,8 +273,11 @@ fn zipped(values: &[String], i: usize) -> Option<&String> {
     }
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> anyhow::Result<ExitCode> {
+/// Startup order is security-load-bearing. The Agent is deliberately **not** a
+/// `#[tokio::main]` binary: Tier-0 hardening (Landlock + seccomp) must be applied
+/// while the process is single-threaded so every tokio worker inherits it (Landlock
+/// has no TSYNC), so the multi-thread runtime is built by hand **after** hardening.
+fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
 
     // `--version-json` is a pure query: no logging side effects, no init.
@@ -276,7 +288,10 @@ async fn main() -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    telemetry::init(cli.log.as_deref());
+    // Early, before hardening, so startup logs (incl. the root refusal + the
+    // hardening report) are captured. The optional OTLP exporter runs on its own
+    // runtime held by this guard (telemetry::init).
+    let _telemetry = telemetry::init(cli.log.as_deref());
 
     // Fail closed if the single explicit TLS backend cannot be installed.
     init_process().context("process initialisation")?;
@@ -288,12 +303,36 @@ async fn main() -> anyhow::Result<ExitCode> {
     match cli.command {
         Some(Command::Run(args)) => {
             let once = args.once;
+            let require_full_landlock = args.require_full_landlock;
             // Built (and loopback-validated) BEFORE any credential work, so a bad
             // splice target or too-few diverse channels fails startup closed rather
-            // than after enrolling.
+            // than after enrolling. Also gives hardening the concrete paths/ports.
             let gateway = args.gateway_config()?;
             let config = args.into_config()?;
-            run(config, gateway, once).await
+
+            // Tier-0 hardening (Landlock + seccomp + coredump), fail-closed, while
+            // still single-threaded — every worker of the runtime built below
+            // inherits it. The OTLP collector (if any) is permitted egress.
+            let otlp_port = telemetry::otlp_endpoint()
+                .as_deref()
+                .and_then(hardening::otlp_port);
+            let report = hardening::apply(&config, &gateway, otlp_port)
+                .context("applying Tier-0 runtime hardening")?;
+            if require_full_landlock && report.landlock != hardening::Landlock::FullyEnforced {
+                anyhow::bail!(
+                    "--require-full-landlock is set but Landlock is {:?}, not FullyEnforced — \
+                     refusing to run with degraded filesystem/network-egress confinement (the \
+                     network ABI needs Linux ≥6.7). Deploy on a Landlock-capable kernel, or drop \
+                     the flag to accept the documented degrade.",
+                    report.landlock
+                );
+            }
+
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("building the tokio runtime")?;
+            runtime.block_on(run(config, gateway, once))
         }
         None => {
             let info = version::component_info();

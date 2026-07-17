@@ -135,10 +135,21 @@ CSR generation — key custody, D2/§15), `p256` (MtlsJoin proof-of-possession
 ECDSA signing), `rand_core` (renew-ahead jitter), `pem` (DER↔PEM anchors),
 `fd-lock` (single-writer data-dir lock, §8.2), `zeroize` (scrub key/token),
 `serde`/`serde_json` (persisted manifest + `--version-json`),
-`thiserror`/`anyhow` (errors), `clap` (CLI), `libc` (euid probe). Build-only:
-`tonic-prost-build`. Dev-only: `rcgen` gains `x509-parser` via feature-unification
-(the mock CP signs CSRs) so production stays lean. Adding a runtime dependency is
-a supply-chain decision — justify it here and keep the set minimal (NFR-7).
+`thiserror`/`anyhow` (errors), `clap` (CLI), `libc` (euid probe + the
+prctl/setrlimit constants Tier-0 hardening uses). Build-only: `tonic-prost-build`.
+Dev-only: `rcgen` gains `x509-parser` via feature-unification (the mock CP signs
+CSRs) so production stays lean. Adding a runtime dependency is a supply-chain
+decision — justify it here and keep the set minimal (NFR-7).
+
+**Session 21 additions.** Tier-0 hardening (Linux-only, `cfg(target_os="linux")`):
+`seccompiler` (pure-Rust seccomp-BPF — one fewer non-Rust input than libseccomp)
+builds+installs the syscall allow-list; `landlock` applies the filesystem + network
+egress rulesets. OpenTelemetry (Part C, off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is
+set): `opentelemetry` + `opentelemetry_sdk` (the SDK), `opentelemetry-otlp`
+(`grpc-tonic` + **`tls-ring`**, never native-TLS — the OpenSSL ban holds; it reuses
+the same tonic 0.14 already in the tree, no duplicate), `tracing-opentelemetry`
+(the `tracing`→OTel bridge). All new crates' licenses (MIT / Apache-2.0 /
+BSD-3-Clause) are already in the `deny.toml` allow-list.
 
 ---
 

@@ -77,11 +77,35 @@ but fix the root cause: correct the TTL/backdate ratio and/or NTP sync.
 - **NTP-synced clocks** are assumed (FR-BOOT-4); certs are backdated for skew and
   the Agent expires credentials conservatively.
 
-## Observability (S12 limits)
-No metrics/health surface yet (S13). Until then: alert on the exit codes above and
-on the `SECURITY` / `REPAIR-NEEDED` log lines. Time-to-cert-expiry, renewal
-attempt/failure counters, and the current generation become metrics with the S13
-transport (tracked as Accepted-Risk finding F-observability-1).
+## Observability — logs, exit codes, OpenTelemetry (S21)
+The Agent is outbound-only, so it exposes **no inbound metrics/health endpoint** by
+design (a scrape port would contradict "no inbound reachability"). Its signals are:
+- the **exit codes** above and the `SECURITY` / `REPAIR-NEEDED` log lines (alert on
+  both);
+- **OpenTelemetry spans** (S21): `agent.enroll`, `agent.renew`, `agent.dial_back`,
+  `agent.splice`, each stamped with `sessionlayer.session_id` so a trace pivots to
+  the CP audit chain + recording by the same id. Export is **off** unless
+  `OTEL_EXPORTER_OTLP_ENDPOINT` is set (OTLP/gRPC, ring TLS); `OTEL_SERVICE_NAME`
+  defaults to `sessionlayer-agent`. Spans carry IDs/enums/durations only — never
+  tokens/keys/plaintext. When export is on, the collector's port is auto-added to
+  the Landlock egress allow-list.
+
+## Tier-0 runtime hardening (S21, Part A) — troubleshooting
+The Agent applies seccomp + Landlock + coredump hygiene at startup, **fail-closed**,
+and logs `Tier-0 runtime hardening applied` once done (with the Landlock status,
+seccomp syscall count, and the egress port allow-list). See `deploy/README.md`.
+- **Agent killed with signal `SIGSYS` (or the container reports a seccomp kill):** a
+  syscall outside the allow-list was attempted — either a genuine anomaly, or (after
+  a toolchain/dep bump) a newly-needed syscall. The allow-list is in
+  `src/hardening/imp.rs` (`allowed_syscalls`); the Docker `splice_e2e` validates the
+  full data path against it.
+- **Log `Landlock is UNAVAILABLE ... ACCEPTED-RISK` / `PARTIALLY enforced`:** the
+  kernel lacks Landlock (needs Linux ≥5.13; network egress needs ≥6.7). Documented
+  degrade — seccomp + the loopback-only splice validation still hold; deploy on a
+  newer kernel + the container `securityContext` for full confinement.
+- **Startup aborts with a hardening error (e.g. `data-dir ... must exist`):** a path
+  hardening must confine is missing/unwritable, or seccomp could not install. This is
+  fail-closed — the Agent will not run unhardened. Fix the data-dir / permissions.
 
 ---
 

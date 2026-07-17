@@ -26,6 +26,17 @@ node needs **no inbound holes** and the Gateway never trusts the node on TOFU
   (zeroized in memory, `0600` on disk).
 - **One explicit TLS backend**: a single `rustls` (ring) crypto provider is
   installed at startup; the C OpenSSL stack is banned from the dependency tree.
+- **Tier-0 runtime hardening (S21, fail-closed)**: seccomp syscall allow-list,
+  Landlock filesystem (writes confined to the data-dir) + network egress allow-list
+  (CP + Gateways + the loopback splice + any OTLP collector), coredump/ptrace
+  disabled — applied before the runtime is built so every worker inherits it. A
+  kernel without Landlock is a documented, loud Accepted-Risk degrade. See
+  [`deploy/`](deploy/) for the read-only-rootfs container/k8s posture.
+- **Observability without content (S21)**: OpenTelemetry spans (`agent.enroll` /
+  `agent.renew` / `agent.dial_back` / `agent.splice`) correlated by
+  `sessionlayer.session_id`; OTLP export (tonic/ring) is off unless
+  `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Spans carry IDs only — never keys/tokens/
+  plaintext.
 
 ## Build & test
 
