@@ -197,11 +197,17 @@ fn check_provenance(
             )))
         }
     }
-    if !prov
-        .source_repo_refs
-        .iter()
-        .any(|r| r.contains(&policy.source_repo_uri))
-    {
+    // Match the repo URI exactly or as a path prefix (`…/Agent` or
+    // `…/Agent/.github/workflows/…`), never a bare substring (`…/Agent-evil`
+    // must not match). The authoritative repo gate is still the `==` on the
+    // Fulcio source-repo OID in `verify_identity`; this is defence-in-depth.
+    let repo = &policy.source_repo_uri;
+    let repo_matches = |r: &String| {
+        r == repo
+            || r.strip_prefix(repo)
+                .is_some_and(|rest| rest.starts_with('/'))
+    };
+    if !prov.source_repo_refs.iter().any(repo_matches) {
         return Err(VerifyError::Provenance(
             "provenance does not name the expected source repository".into(),
         ));

@@ -463,3 +463,58 @@ fn install_never_writes_an_unverified_binary() {
     updater.install(&cand, &blob, &prov, &live).unwrap();
     assert_eq!(std::fs::read(&live).unwrap(), f.binary);
 }
+
+#[test]
+fn install_writes_verified_bytes_under_concurrent_mutation() {
+    // TOCTOU regression: install must write the exact bytes it VERIFIED, never a
+    // second read of the candidate path. A mutator thread rewrites the candidate
+    // between (and during) install calls; every install that returns Ok MUST have
+    // written content whose digest equals the verified digest. The old re-read
+    // (`fs::copy(candidate,..)`) would sometimes install garbage under this race.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let f = build(Params::default());
+    let updater = crate::update::SelfUpdater::new(f.trust.clone(), f.policy.clone());
+    let blob = f.blob_bundle(&f.binary);
+    let prov = f.prov_bundle(&f.binary);
+    let tmp = tempfile::tempdir().unwrap();
+    let cand = tmp.path().join("candidate");
+    let live = tmp.path().join("live");
+    std::fs::write(&cand, &f.binary).unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mutator = {
+        let cand = cand.clone();
+        let good = f.binary.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let _ = std::fs::write(&cand, b"GARBAGE-not-the-verified-binary");
+                let _ = std::fs::write(&cand, &good);
+            }
+        })
+    };
+
+    let want = to_hex(&Sha256::digest(&f.binary));
+    let mut ok_installs = 0;
+    for _ in 0..60 {
+        // Bias toward a good read so the race window (read→verify→write) is
+        // actually exercised on Ok installs; the mutator still corrupts freely.
+        let _ = std::fs::write(&cand, &f.binary);
+        if updater.install(&cand, &blob, &prov, &live).is_ok() {
+            let installed = to_hex(&Sha256::digest(std::fs::read(&live).unwrap()));
+            assert_eq!(
+                installed, want,
+                "install wrote content != the verified digest (TOCTOU)"
+            );
+            ok_installs += 1;
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    mutator.join().unwrap();
+    assert!(
+        ok_installs > 0,
+        "the race never let a valid install through — test ineffective"
+    );
+}
