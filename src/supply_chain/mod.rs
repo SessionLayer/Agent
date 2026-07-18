@@ -18,10 +18,12 @@
 
 mod bundle;
 mod cert;
+mod der;
 mod dsse;
 mod error;
 mod policy;
 mod rekor;
+mod sct;
 mod trust;
 
 use std::path::Path;
@@ -142,6 +144,8 @@ fn verify_identity<'b>(
     let integrated_time = rekor::verify_set(entry, &trust.rekor_keys)?;
     let leaf_der = bundle.leaf_cert_der()?;
     let leaf = cert::parse_and_chain(&leaf_der, trust, integrated_time)?;
+    // Bind the transparency entry to *this* leaf, not merely to the digest.
+    rekor::require_body_binds_leaf(entry, &leaf_der)?;
 
     match &leaf.issuer {
         Some(i) if i == &policy.oidc_issuer => {}

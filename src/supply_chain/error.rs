@@ -41,6 +41,13 @@ pub enum VerifyError {
     #[error("transparency (Rekor) verification failed: {0}")]
     Transparency(String),
 
+    /// Certificate-transparency requirement: the Fulcio leaf carries no embedded
+    /// Signed Certificate Timestamp, or none verifies under a pinned, in-window CT
+    /// log key — i.e. we cannot prove the cert was actually logged (a rogue Fulcio
+    /// could issue off-log). Fail closed.
+    #[error("certificate transparency (SCT) verification failed: {0}")]
+    Sct(String),
+
     #[error("cryptographic signature does not verify: {0}")]
     Signature(String),
 
