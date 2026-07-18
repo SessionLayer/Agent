@@ -9,7 +9,7 @@ use x509_parser::prelude::*;
 
 use super::error::VerifyError;
 use super::policy;
-use super::trust::TrustRoot;
+use super::trust::{TimeRange, TrustRoot};
 
 pub struct LeafInfo {
     pub san: Option<String>,
@@ -30,17 +30,17 @@ pub fn parse_and_chain(
     let (_, leaf) = X509Certificate::from_der(leaf_der)
         .map_err(|e| VerifyError::Chain(format!("leaf parse: {e}")))?;
 
-    let ca_ders = &trust.fulcio_cas;
-    if ca_ders.is_empty() {
+    if trust.fulcio_cas.is_empty() {
         return Err(VerifyError::TrustAnchor(
             "no pinned Fulcio CA certificates".into(),
         ));
     }
-    let cas: Vec<X509Certificate<'_>> = ca_ders
+    let cas: Vec<(X509Certificate<'_>, TimeRange)> = trust
+        .fulcio_cas
         .iter()
-        .map(|der| {
-            X509Certificate::from_der(der)
-                .map(|(_, c)| c)
+        .map(|ca| {
+            X509Certificate::from_der(&ca.der)
+                .map(|(_, c)| (c, ca.valid_for))
                 .map_err(|e| VerifyError::TrustAnchor(format!("pinned CA parse: {e}")))
         })
         .collect::<Result<_, _>>()?;
@@ -69,14 +69,14 @@ pub fn parse_and_chain(
 /// issuer signature and CA constraint. Fail closed if any link is missing.
 fn verify_chain(
     leaf: &X509Certificate<'_>,
-    cas: &[X509Certificate<'_>],
+    cas: &[(X509Certificate<'_>, TimeRange)],
     at_time: i64,
 ) -> Result<(), VerifyError> {
     let mut current = leaf;
     for _ in 0..6 {
-        let issuer = cas
+        let (issuer, window) = cas
             .iter()
-            .find(|ca| {
+            .find(|(ca, _)| {
                 ca.subject() == current.issuer()
                     && current.verify_signature(Some(ca.public_key())).is_ok()
             })
@@ -93,6 +93,16 @@ fn verify_chain(
         if at_time < inb || at_time > ina {
             return Err(VerifyError::CertValidity(format!(
                 "pinned CA {:?} not valid at log time {at_time}",
+                issuer.subject().to_string()
+            )));
+        }
+        // The Sigstore trusted-root `validFor` bounds when this CA may anchor a
+        // signature — enforce it against the trusted clock so a retired-but-
+        // still-unexpired Fulcio CA cannot vouch for a fresh signing event
+        // (F-supplychain-validfor-1).
+        if !window.contains(at_time) {
+            return Err(VerifyError::CertValidity(format!(
+                "pinned CA {:?} outside its trusted-root validity window at log time {at_time}",
                 issuer.subject().to_string()
             )));
         }

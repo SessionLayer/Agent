@@ -230,6 +230,11 @@ fn allowed_syscalls() -> Vec<i64> {
         libc::SYS_pread64,
         libc::SYS_pwrite64,
         libc::SYS_close,
+        // Defensive (drift-guard): a glibc/tokio bump can reach `openat2`
+        // (resolve-flags open) or `close_range` (bulk fd close). KillProcess
+        // default makes any such miss a fleet crash-loop, so carry them.
+        libc::SYS_openat2,
+        libc::SYS_close_range,
         libc::SYS_lseek,
         libc::SYS_openat,
         libc::SYS_fcntl,
@@ -286,6 +291,11 @@ fn allowed_syscalls() -> Vec<i64> {
         libc::SYS_munmap,
         libc::SYS_mremap,
         libc::SYS_madvise,
+        // Defensive: `zeroize`/ring may pin secret pages against swap on a future
+        // bump. Locking memory is benign under our rlimits; a miss would be fatal.
+        libc::SYS_mlock,
+        libc::SYS_mlock2,
+        libc::SYS_mlockall,
         // ---- threads & synchronisation (tokio workers, pthread) ----
         libc::SYS_clone,
         libc::SYS_clone3,
@@ -296,6 +306,9 @@ fn allowed_syscalls() -> Vec<i64> {
         libc::SYS_rseq,
         libc::SYS_set_tid_address,
         libc::SYS_sched_getaffinity,
+        // Defensive: tokio may pin worker threads to cores (`sched_setaffinity`)
+        // under a future runtime-config path.
+        libc::SYS_sched_setaffinity,
         libc::SYS_sched_yield,
         libc::SYS_membarrier,
         // ---- signals (tokio SIGTERM/SIGINT, panic=abort path) ----
@@ -303,6 +316,10 @@ fn allowed_syscalls() -> Vec<i64> {
         libc::SYS_rt_sigprocmask,
         libc::SYS_rt_sigreturn,
         libc::SYS_rt_sigtimedwait,
+        // Defensive: signal-handling glibc paths can query/wait on the pending or
+        // blocked set (`rt_sigpending`/`rt_sigsuspend`) on a future bump.
+        libc::SYS_rt_sigpending,
+        libc::SYS_rt_sigsuspend,
         libc::SYS_sigaltstack,
         libc::SYS_tgkill,
         // ---- time ----
@@ -325,6 +342,11 @@ fn allowed_syscalls() -> Vec<i64> {
         libc::SYS_geteuid,
         libc::SYS_getgid,
         libc::SYS_getegid,
+        // Defensive: credential-introspection reads glibc/TLS init may perform
+        // (`getgroups`, `getres{uid,gid}`) — all read-only, harmless to allow.
+        libc::SYS_getgroups,
+        libc::SYS_getresuid,
+        libc::SYS_getresgid,
         libc::SYS_exit,
         libc::SYS_exit_group,
         libc::SYS_restart_syscall,
@@ -350,4 +372,32 @@ fn allowed_syscalls() -> Vec<i64> {
     ]);
 
     s
+}
+
+#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod tests {
+    use super::*;
+
+    /// Guards the KILL-default allow-list against silently dropping the
+    /// defensive drift-guard entries (F-seccomp-defensive-entries-1) — a removal
+    /// here is a fleet crash-loop the E2E tests would not necessarily surface.
+    #[test]
+    fn allow_list_carries_defensive_syscalls() {
+        let allowed = allowed_syscalls();
+        for sc in [
+            libc::SYS_openat2,
+            libc::SYS_close_range,
+            libc::SYS_mlock,
+            libc::SYS_mlock2,
+            libc::SYS_mlockall,
+            libc::SYS_getgroups,
+            libc::SYS_getresuid,
+            libc::SYS_getresgid,
+            libc::SYS_sched_setaffinity,
+            libc::SYS_rt_sigpending,
+            libc::SYS_rt_sigsuspend,
+        ] {
+            assert!(allowed.contains(&sc), "syscall {sc} must stay on the allow-list");
+        }
+    }
 }

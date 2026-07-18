@@ -3,6 +3,12 @@
 - Status: Accepted-Risk
 - Area: supplychain
 
+## SUPERSEDED
+Superseded by `audit/closed/F-supplychain-validfor-1.md` (S23), which upgraded this
+to MEDIUM and **fixed** it: the verifier now parses each trusted-root `validFor`
+window and rejects a Rekor SET / Fulcio CA whose window does not contain the log
+`integratedTime`. The original S22 Accepted-Risk text is kept below for history.
+
 ## Summary
 The verifier trusts every CA/tlog key in the pinned trusted_root.json without
 checking each key's `validFor` window against the entry's integratedTime, so a
