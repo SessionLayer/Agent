@@ -128,12 +128,25 @@ impl TrustRoot {
             }
         }
 
+        // Declared-but-none-usable is a broken trust root, not "no CT" — e.g. the
+        // Sigstore CT log rotates to a key type this P-256 parser cannot decode, or
+        // a malformed key. Skipping it would silently disable SCT (fail OPEN in the
+        // exact control S24 hardens), so fail closed at load. An empty-DECLARED
+        // ctlogs stays "SCT optional" (sigstore-go compat) but is warned + enforced
+        // per-policy at verify time (F-supplychain-ctlogs-required-1).
+        if !tr.ctlogs.is_empty() && ctlog_keys.is_empty() {
+            return Err(VerifyError::TrustAnchor(
+                "trusted_root.json declares CT logs but none are usable (unsupported key type \
+                 or malformed) — refusing so SCT verification cannot be silently disabled"
+                    .into(),
+            ));
+        }
         if ctlog_keys.is_empty() {
-            // Not fatal here (some private deployments run no CT log); the pinned
+            // No CT log declared: some private deployments run none. The pinned
             // production identity turns this into a hard refusal at verify time
             // (VerificationPolicy::require_certificate_transparency).
             tracing::warn!(
-                "pinned trusted_root.json contains no CT-log keys — Fulcio SCT verification \
+                "pinned trusted_root.json declares no CT-log keys — Fulcio SCT verification \
                  will be skipped unless the verification policy requires it"
             );
         }

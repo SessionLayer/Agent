@@ -702,6 +702,49 @@ fn refuses_pinned_identity_when_trust_root_pins_no_ctlogs() {
     assert!(matches!(err, VerifyError::Sct(_)), "got {err:?}");
 }
 
+/// Declared-but-UNUSABLE ctlogs must FAIL TO LOAD, not silently disable SCT: a
+/// trust root that declares a ctlog whose key is a valid P-384 SPKI (a CT key type
+/// this P-256 parser can't decode — the realistic Sigstore-rotation case) is
+/// refused at load (Sec-F1 / F-supplychain-ctlogs-required-1).
+#[test]
+fn refuses_trust_root_that_declares_unusable_ctlogs() {
+    let f = build(Params::default());
+    let window = json!({ "start": "2020-01-01T00:00:00.000Z" });
+    let certs: Vec<Value> = f
+        .trust
+        .fulcio_cas
+        .iter()
+        .map(|ca| json!({ "rawBytes": b64(&ca.der) }))
+        .collect();
+    let rekor_spki = f.trust.rekor_keys[0].key.to_public_key_der().unwrap();
+    let p384 = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+    let p384_spki = pem::parse(p384.public_key_pem())
+        .unwrap()
+        .contents()
+        .to_vec();
+    let tr = json!({
+        "tlogs": [ { "publicKey": {
+            "rawBytes": b64(rekor_spki.as_bytes()),
+            "keyDetails": "PKIX_ECDSA_P256_SHA_256",
+            "validFor": window,
+        } } ],
+        "certificateAuthorities": [ {
+            "certChain": { "certificates": certs },
+            "validFor": window,
+        } ],
+        "ctlogs": [ { "publicKey": {
+            "rawBytes": b64(&p384_spki),
+            "keyDetails": "PKIX_ECDSA_P384_SHA_384",
+            "validFor": window,
+        } } ],
+    });
+    let loaded = TrustRoot::from_trusted_root_json(&serde_json::to_vec(&tr).unwrap());
+    assert!(
+        matches!(loaded, Err(VerifyError::TrustAnchor(_))),
+        "a trust root that declares an unusable CT log must fail to load"
+    );
+}
+
 // --- Leaf ⇄ Rekor-body cross-bind: the cert embedded in the log entry body must
 // be the very leaf that signed the artifact.
 
