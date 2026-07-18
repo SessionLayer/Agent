@@ -82,9 +82,17 @@ Fulcio intermediate and Rekor keys periodically; the TUF-distributed
   Response: refresh + re-pin `trusted_root.json`, redeploy; do **not** disable
   verification. A single node failing = its file is corrupt/missing; the whole
   fleet failing at once = a stale trust root.
-- The tool trusts every CA/tlog key present in the file (it does not itself
-  enforce `validFor` windows), so **the digest-pin is the control** — only ship a
+- The tool enforces each Fulcio-CA / Rekor-tlog / CT-log key's `validFor` window
+  against the Rekor `integratedTime` (a retired-then-compromised pinned key cannot
+  forge a fresh signing event), but it still trusts whatever material the file
+  pins, so **the digest-pin remains the primary control** — only ship a
   `trusted_root.json` you fetched from the authentic TUF root.
+- **Certificate transparency (SCT):** when the pinned `trusted_root.json` includes
+  `ctlogs` (the standard Sigstore root does), the verifier requires the Fulcio
+  leaf's embedded SCT to verify under a pinned CT-log key — a release the CA never
+  logged to CT is refused. Ship a `trusted_root.json` that includes `ctlogs` to keep
+  this enforced; a file with no `ctlogs` disables SCT checking (matches cosign when
+  no CT log is configured).
 
 ## Alert: log `SECURITY: generation mismatch on renewal ... auto-locked` (exit 3)
 Cause: two live copies of the credential forked the generation counter (a clone),
