@@ -9,6 +9,7 @@ use x509_parser::prelude::*;
 
 use super::error::VerifyError;
 use super::policy;
+use super::sct;
 use super::trust::{TimeRange, TrustRoot};
 
 pub struct LeafInfo {
@@ -45,7 +46,7 @@ pub fn parse_and_chain(
         })
         .collect::<Result<_, _>>()?;
 
-    verify_chain(&leaf, &cas, at_time)?;
+    let issuer_spki = verify_chain(&leaf, &cas, at_time)?;
 
     let nb = leaf.validity().not_before.timestamp();
     let na = leaf.validity().not_after.timestamp();
@@ -56,6 +57,8 @@ pub fn parse_and_chain(
     }
 
     require_code_signing(&leaf)?;
+    // Prove the CA logged this cert to a pinned CT log (no-op if none pinned).
+    sct::verify_embedded_scts(leaf_der, &leaf, &issuer_spki, &trust.ctlog_keys, at_time)?;
 
     Ok(LeafInfo {
         san: extract_san_uri(&leaf),
@@ -67,12 +70,15 @@ pub fn parse_and_chain(
 
 /// Walk leaf → pinned intermediate → pinned self-signed root, verifying every
 /// issuer signature and CA constraint. Fail closed if any link is missing.
+/// Returns the SubjectPublicKeyInfo DER of the leaf's **direct** issuer (the CT
+/// precert `issuer_key_hash` input).
 fn verify_chain(
     leaf: &X509Certificate<'_>,
     cas: &[(X509Certificate<'_>, TimeRange)],
     at_time: i64,
-) -> Result<(), VerifyError> {
+) -> Result<Vec<u8>, VerifyError> {
     let mut current = leaf;
+    let mut leaf_issuer_spki: Option<Vec<u8>> = None;
     for _ in 0..6 {
         let (issuer, window) = cas
             .iter()
@@ -87,6 +93,7 @@ fn verify_chain(
                 ))
             })?;
 
+        leaf_issuer_spki.get_or_insert_with(|| issuer.public_key().raw.to_vec());
         require_ca(issuer)?;
         let inb = issuer.validity().not_before.timestamp();
         let ina = issuer.validity().not_after.timestamp();
@@ -112,7 +119,7 @@ fn verify_chain(
             issuer
                 .verify_signature(Some(issuer.public_key()))
                 .map_err(|e| VerifyError::Chain(format!("pinned root self-signature: {e}")))?;
-            return Ok(());
+            return Ok(leaf_issuer_spki.expect("at least one issuer walked"));
         }
         current = issuer;
     }

@@ -18,10 +18,12 @@
 
 mod bundle;
 mod cert;
+mod der;
 mod dsse;
 mod error;
 mod policy;
 mod rekor;
+mod sct;
 mod trust;
 
 use std::path::Path;
@@ -58,6 +60,17 @@ pub fn verify_binary(
 ) -> Result<VerifiedRelease, VerifyError> {
     let digest = Sha256::digest(binary);
     let digest_hex = hex(&digest);
+
+    // Fail closed if the policy requires certificate transparency but the pinned
+    // trust root pins no CT-log key — otherwise a ctlog-less `trusted_root.json`
+    // silently disables SCT verification (F-supplychain-ctlogs-required-1).
+    if policy.require_certificate_transparency && trust.ctlog_keys.is_empty() {
+        return Err(VerifyError::Sct(
+            "policy requires certificate transparency but the pinned trust root pins no CT-log \
+             keys — refusing so SCT verification cannot be silently disabled"
+                .into(),
+        ));
+    }
 
     // (1) The SLSA provenance attestation — identity + what-was-built.
     let (prov_leaf, prov_entry) = verify_identity(provenance_bundle, policy, trust)?;
@@ -142,6 +155,8 @@ fn verify_identity<'b>(
     let integrated_time = rekor::verify_set(entry, &trust.rekor_keys)?;
     let leaf_der = bundle.leaf_cert_der()?;
     let leaf = cert::parse_and_chain(&leaf_der, trust, integrated_time)?;
+    // Bind the transparency entry to *this* leaf, not merely to the digest.
+    rekor::require_body_binds_leaf(entry, &leaf_der)?;
 
     match &leaf.issuer {
         Some(i) if i == &policy.oidc_issuer => {}

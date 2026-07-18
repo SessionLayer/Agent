@@ -220,7 +220,9 @@ fn target_arch() -> seccompiler::TargetArch {
 /// Anything outside it is killed (`SECCOMP_RET_KILL_PROCESS`).
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn allowed_syscalls() -> Vec<i64> {
-    // Present on both x86_64 and aarch64.
+    // Present on both x86_64 and aarch64. `mut` is used only by the x86_64 legacy
+    // block below; on aarch64 the list is complete as-is.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
     let mut s: Vec<i64> = vec![
         // ---- file & directory I/O (data-dir persist, config reads, NSS dlopen) ----
         libc::SYS_read,

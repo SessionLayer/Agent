@@ -37,6 +37,8 @@ jobs:
         with:
           toolchain: "1.95.0"
           components: rustfmt, clippy
+          # arm64 std for the aarch64 build-level proof (S24 / carry-forward B4).
+          targets: aarch64-unknown-linux-gnu
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
@@ -53,3 +55,18 @@ jobs:
 
       - name: Gate (fmt, clippy, nextest, audit, deny, findings)
         run: ./scripts/gate.sh
+
+      # Build-level proof the arm64 target compiles — the Tier-0 seccomp allow-list
+      # is arch-parameterized (S23 B4); this is the missing CI cross-check. `ring`'s
+      # C needs the cross linker/compiler; std comes from the toolchain `targets`.
+      - name: Install aarch64 cross linker + target libc headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+      - name: aarch64 cross-check (cargo check --target aarch64-unknown-linux-gnu)
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+        run: cargo check --target aarch64-unknown-linux-gnu --locked

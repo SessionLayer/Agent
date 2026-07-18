@@ -7,6 +7,7 @@
 use base64::Engine as _;
 use p256::pkcs8::spki::DecodePublicKey;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use super::error::VerifyError;
 
@@ -42,12 +43,24 @@ pub struct RekorKey {
     pub valid_for: TimeRange,
 }
 
+/// A pinned Certificate-Transparency log key (P-256). `log_id` is the RFC 6962
+/// LogID — SHA-256 of the key's SubjectPublicKeyInfo — matched against the SCT's
+/// embedded log id. `valid_for` bounds when it may vouch for a logged cert.
+#[derive(Clone)]
+pub struct CtLogKey {
+    pub key: p256::ecdsa::VerifyingKey,
+    pub log_id: [u8; 32],
+    pub valid_for: TimeRange,
+}
+
 #[derive(Clone)]
 pub struct TrustRoot {
     /// Fulcio CA certificates (root + intermediate), DER, each with its window.
     pub fulcio_cas: Vec<FulcioCa>,
     /// Rekor log signing keys (P-256), each with its window.
     pub rekor_keys: Vec<RekorKey>,
+    /// Certificate-Transparency log keys (P-256). Empty ⇒ SCT not enforced.
+    pub ctlog_keys: Vec<CtLogKey>,
 }
 
 impl TrustRoot {
@@ -93,9 +106,55 @@ impl TrustRoot {
             ));
         }
 
+        // CT logs are optional in the schema; when present we pin the P-256 keys
+        // (same skip-the-unparseable policy as Rekor). Their presence makes SCT
+        // verification mandatory downstream ([`super::sct`]).
+        let mut ctlog_keys = Vec::new();
+        for ctlog in &tr.ctlogs {
+            let spki = match decode_b64(&ctlog.public_key.raw_bytes) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let parsed = verifying_key_from_spki(&spki)
+                .ok()
+                .zip(parse_time_range(ctlog.public_key.valid_for.as_ref()).ok());
+            if let Some((key, valid_for)) = parsed {
+                let log_id: [u8; 32] = Sha256::digest(&spki).into();
+                ctlog_keys.push(CtLogKey {
+                    key,
+                    log_id,
+                    valid_for,
+                });
+            }
+        }
+
+        // Declared-but-none-usable is a broken trust root, not "no CT" — e.g. the
+        // Sigstore CT log rotates to a key type this P-256 parser cannot decode, or
+        // a malformed key. Skipping it would silently disable SCT (fail OPEN in the
+        // exact control S24 hardens), so fail closed at load. An empty-DECLARED
+        // ctlogs stays "SCT optional" (sigstore-go compat) but is warned + enforced
+        // per-policy at verify time (F-supplychain-ctlogs-required-1).
+        if !tr.ctlogs.is_empty() && ctlog_keys.is_empty() {
+            return Err(VerifyError::TrustAnchor(
+                "trusted_root.json declares CT logs but none are usable (unsupported key type \
+                 or malformed) — refusing so SCT verification cannot be silently disabled"
+                    .into(),
+            ));
+        }
+        if ctlog_keys.is_empty() {
+            // No CT log declared: some private deployments run none. The pinned
+            // production identity turns this into a hard refusal at verify time
+            // (VerificationPolicy::require_certificate_transparency).
+            tracing::warn!(
+                "pinned trusted_root.json declares no CT-log keys — Fulcio SCT verification \
+                 will be skipped unless the verification policy requires it"
+            );
+        }
+
         Ok(Self {
             fulcio_cas,
             rekor_keys,
+            ctlog_keys,
         })
     }
 }
@@ -198,6 +257,8 @@ struct TrustedRoot {
     tlogs: Vec<Tlog>,
     #[serde(default)]
     certificate_authorities: Vec<CertificateAuthority>,
+    #[serde(default)]
+    ctlogs: Vec<Tlog>,
 }
 
 #[derive(Debug, Deserialize)]

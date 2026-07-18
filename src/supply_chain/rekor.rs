@@ -7,6 +7,7 @@
 
 use base64::Engine as _;
 use p256::ecdsa::signature::Verifier;
+use serde_json::Value;
 
 use super::bundle::TlogEntry;
 use super::error::VerifyError;
@@ -85,6 +86,63 @@ pub fn require_body_binds(entry: &TlogEntry, digest_hex: &str) -> Result<(), Ver
         Err(VerifyError::Transparency(
             "Rekor entry body does not reference the artifact digest".into(),
         ))
+    }
+}
+
+/// Fail closed unless the certificate embedded in the Rekor entry body is exactly
+/// the leaf that signed the artifact. Binding the tlog entry to the *verified
+/// leaf* (not merely "a Rekor entry exists for this digest") stops a valid SET +
+/// body from an unrelated signing event being stitched onto this leaf.
+pub fn require_body_binds_leaf(entry: &TlogEntry, leaf_der: &[u8]) -> Result<(), VerifyError> {
+    let body = entry.body_bytes()?;
+    let v: Value = serde_json::from_slice(&body)
+        .map_err(|e| VerifyError::Transparency(format!("Rekor entry body is not JSON: {e}")))?;
+
+    // The cert lives at different JSON paths across Rekor entry kinds: hashedrekord
+    // (`spec.signature.publicKey.content`), dsse/intoto (`spec.signatures[].verifier`
+    // or `spec.publicKey`). Each is base64 of a PEM (or DER) certificate.
+    let mut found_any = false;
+    for c in embedded_cert_candidates(&v) {
+        let der = match decode_cert(c) {
+            Some(d) => d,
+            None => continue,
+        };
+        found_any = true;
+        if der == leaf_der {
+            return Ok(());
+        }
+    }
+    Err(VerifyError::Transparency(if found_any {
+        "Rekor entry body embeds a certificate other than the signing leaf".into()
+    } else {
+        "Rekor entry body embeds no signing certificate to cross-bind".into()
+    }))
+}
+
+fn embedded_cert_candidates(v: &Value) -> Vec<&str> {
+    let mut out = Vec::new();
+    out.extend(
+        v.pointer("/spec/signature/publicKey/content")
+            .and_then(Value::as_str),
+    );
+    out.extend(v.pointer("/spec/publicKey").and_then(Value::as_str));
+    if let Some(sigs) = v.pointer("/spec/signatures").and_then(Value::as_array) {
+        for s in sigs {
+            out.extend(s.get("verifier").and_then(Value::as_str));
+        }
+    }
+    out
+}
+
+/// A candidate is base64 of either a PEM certificate or raw DER.
+fn decode_cert(b64_str: &str) -> Option<Vec<u8>> {
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(b64_str.trim())
+        .ok()?;
+    if raw.starts_with(b"-----BEGIN") {
+        pem::parse(&raw).ok().map(|p| p.contents().to_vec())
+    } else {
+        Some(raw)
     }
 }
 

@@ -10,16 +10,20 @@
 
 use base64::Engine as _;
 use p256::ecdsa::signature::Signer;
+use p256::pkcs8::EncodePublicKey;
 use rcgen::string::Ia5String;
 use rcgen::{
     BasicConstraints, CertificateParams, CustomExtension, DnType, ExtendedKeyUsagePurpose, IsCa,
-    Issuer, KeyPair, KeyUsagePurpose, SanType,
+    Issuer, KeyPair, KeyUsagePurpose, SanType, SerialNumber,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::trust::{FulcioCa, RekorKey, TimeRange};
+use super::trust::{CtLogKey, FulcioCa, RekorKey, TimeRange};
 use super::*;
+
+/// OID `1.3.6.1.4.1.11129.2.4.2` (embedded SCT list), as rcgen OID components.
+const SCT_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 11129, 2, 4, 2];
 
 /// A `validFor` window that contains every fixture's `LOG_TIME` — the default so
 /// the pre-existing tamper matrix is unaffected by window enforcement.
@@ -74,6 +78,15 @@ struct Params {
     forge_chain: bool,
     /// Emit a Rekor provenance body that does NOT reference the payload digest.
     unbind_set: bool,
+    /// Pin a CT-log key in the trust root, making SCT verification mandatory.
+    ct_pinned: bool,
+    /// Embed a precert SCT in the leaf (real Fulcio shape). Requires `ct_pinned`
+    /// to be enforced; without it the leaf simply carries the extension.
+    embed_sct: bool,
+    /// Sign the embedded SCT with a key that is NOT the pinned CT-log key.
+    sct_wrong_key: bool,
+    /// Embed a certificate OTHER than the signing leaf in the Rekor body.
+    wrong_body_cert: bool,
 }
 
 impl Default for Params {
@@ -86,6 +99,10 @@ impl Default for Params {
             leaf_not_after: (2100, 1, 1),
             forge_chain: false,
             unbind_set: false,
+            ct_pinned: false,
+            embed_sct: false,
+            sct_wrong_key: false,
+            wrong_body_cert: false,
         }
     }
 }
@@ -108,7 +125,72 @@ struct Fixture {
     leaf_sk: p256::ecdsa::SigningKey,
     rekor_sk: p256::ecdsa::SigningKey,
     leaf_der: Vec<u8>,
+    /// A different, valid certificate (the CA root) for the wrong-body-cert case.
+    alt_cert_der: Vec<u8>,
     p: Params,
+}
+
+fn spki_of(cert_der: &[u8]) -> Vec<u8> {
+    let (_, c) = x509_parser::parse_x509_certificate(cert_der).unwrap();
+    c.public_key().raw.to_vec()
+}
+
+fn pem_of(der: &[u8]) -> String {
+    pem::encode(&pem::Pem::new("CERTIFICATE", der.to_vec()))
+}
+
+fn der_len(n: usize) -> Vec<u8> {
+    if n < 0x80 {
+        return vec![n as u8];
+    }
+    let mut be = n.to_be_bytes().to_vec();
+    while be.first() == Some(&0) {
+        be.remove(0);
+    }
+    let mut out = vec![0x80 | be.len() as u8];
+    out.extend_from_slice(&be);
+    out
+}
+
+fn u24(n: usize) -> [u8; 3] {
+    let b = (n as u32).to_be_bytes();
+    [b[1], b[2], b[3]]
+}
+
+/// RFC 6962 §3.2 precert signed data — kept independent of `sct.rs` so the accept
+/// test cross-checks the verifier's own encoding AND its precert reconstruction.
+fn sct_signed_data(timestamp_ms: u64, issuer_key_hash: &[u8], precert_tbs: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8, 0u8]; // sct_version v1, signature_type certificate_timestamp
+    out.extend_from_slice(&timestamp_ms.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes()); // precert_entry
+    out.extend_from_slice(issuer_key_hash);
+    out.extend_from_slice(&u24(precert_tbs.len()));
+    out.extend_from_slice(precert_tbs);
+    out.extend_from_slice(&0u16.to_be_bytes()); // CtExtensions (empty)
+    out
+}
+
+/// RFC 6962 §3.3 SignedCertificateTimestampList in the inner DER OCTET STRING the
+/// X.509 extension expects (single SCT).
+fn sct_list_extension(log_id: &[u8; 32], timestamp_ms: u64, sig_der: &[u8]) -> Vec<u8> {
+    let mut sct = vec![0u8]; // version
+    sct.extend_from_slice(log_id);
+    sct.extend_from_slice(&timestamp_ms.to_be_bytes());
+    sct.extend_from_slice(&0u16.to_be_bytes()); // extensions
+    sct.push(4); // hash: sha256
+    sct.push(3); // sig: ecdsa
+    sct.extend_from_slice(&(sig_der.len() as u16).to_be_bytes());
+    sct.extend_from_slice(sig_der);
+
+    let mut entry = (sct.len() as u16).to_be_bytes().to_vec();
+    entry.extend_from_slice(&sct);
+    let mut list = (entry.len() as u16).to_be_bytes().to_vec();
+    list.extend_from_slice(&entry);
+
+    let mut octet = vec![0x04];
+    octet.extend_from_slice(&der_len(list.len()));
+    octet.extend_from_slice(&list);
+    octet
 }
 
 fn build(p: Params) -> Fixture {
@@ -130,29 +212,89 @@ fn build(p: Params) -> Fixture {
     let rogue_issuer = Issuer::new(rogue_params, rogue_key);
 
     let leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-    let mut leaf = CertificateParams::new(Vec::<String>::new()).unwrap();
-    leaf.distinguished_name.push(DnType::CommonName, "sigstore");
-    leaf.subject_alt_names = vec![SanType::URI(Ia5String::try_from(p.san.clone()).unwrap())];
-    leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::CodeSigning];
-    leaf.custom_extensions = vec![
-        CustomExtension::from_oid_content(&[1, 3, 6, 1, 4, 1, 57264, 1, 8], der_utf8(&p.issuer)),
-        CustomExtension::from_oid_content(
-            &[1, 3, 6, 1, 4, 1, 57264, 1, 12],
-            der_utf8(&p.source_repo),
-        ),
-    ];
-    let (ny, nm, nd) = p.leaf_not_before;
-    let (ay, am, ad) = p.leaf_not_after;
-    leaf.not_before = rcgen::date_time_ymd(ny, nm, nd);
-    leaf.not_after = rcgen::date_time_ymd(ay, am, ad);
-    let signer = if p.forge_chain {
-        &rogue_issuer
-    } else {
-        &inter_issuer
+    // Fixed serial so the precert (no SCT) and final (with SCT) leaves differ ONLY
+    // by the SCT extension — the exact relationship the RFC 6962 reconstruction
+    // relies on.
+    let serial = SerialNumber::from(0x5145_1a4e_0be5_71c3u64);
+    let mk = |extra: Option<Vec<u8>>| -> Vec<u8> {
+        let mut leaf = CertificateParams::new(Vec::<String>::new()).unwrap();
+        leaf.distinguished_name.push(DnType::CommonName, "sigstore");
+        leaf.serial_number = Some(serial.clone());
+        leaf.subject_alt_names = vec![SanType::URI(Ia5String::try_from(p.san.clone()).unwrap())];
+        leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::CodeSigning];
+        let mut exts = vec![
+            CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 57264, 1, 8],
+                der_utf8(&p.issuer),
+            ),
+            CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 57264, 1, 12],
+                der_utf8(&p.source_repo),
+            ),
+        ];
+        if let Some(sct) = extra {
+            exts.push(CustomExtension::from_oid_content(SCT_OID, sct));
+        }
+        leaf.custom_extensions = exts;
+        let (ny, nm, nd) = p.leaf_not_before;
+        let (ay, am, ad) = p.leaf_not_after;
+        leaf.not_before = rcgen::date_time_ymd(ny, nm, nd);
+        leaf.not_after = rcgen::date_time_ymd(ay, am, ad);
+        let signer = if p.forge_chain {
+            &rogue_issuer
+        } else {
+            &inter_issuer
+        };
+        leaf.signed_by(&leaf_key, signer).unwrap().der().to_vec()
     };
-    let leaf_cert = leaf.signed_by(&leaf_key, signer).unwrap();
-    let leaf_der = leaf_cert.der().to_vec();
 
+    let issuer_spki = spki_of(&inter_der);
+    let mk_ct_key = || {
+        let sk = p256::ecdsa::SigningKey::random(&mut rand_core::OsRng);
+        let spki = sk.verifying_key().to_public_key_der().unwrap();
+        let log_id: [u8; 32] = Sha256::digest(spki.as_bytes()).into();
+        (sk, log_id)
+    };
+
+    let (leaf_der, ctlog_keys) = if p.embed_sct {
+        let precert_tbs = super::der::tbs_of_certificate(&mk(None)).unwrap();
+        let issuer_key_hash = Sha256::digest(&issuer_spki);
+        let (ct_sk, log_id) = mk_ct_key();
+        let ts_ms = LOG_TIME as u64 * 1000;
+        let signed = sct_signed_data(ts_ms, &issuer_key_hash, &precert_tbs);
+        let sign_sk = if p.sct_wrong_key {
+            p256::ecdsa::SigningKey::random(&mut rand_core::OsRng)
+        } else {
+            ct_sk.clone()
+        };
+        let ct_sig: p256::ecdsa::Signature = sign_sk.sign(&signed);
+        let sct_ext = sct_list_extension(&log_id, ts_ms, ct_sig.to_der().as_bytes());
+        let keys = if p.ct_pinned {
+            vec![CtLogKey {
+                key: *ct_sk.verifying_key(),
+                log_id,
+                valid_for: OPEN_WINDOW,
+            }]
+        } else {
+            vec![]
+        };
+        (mk(Some(sct_ext)), keys)
+    } else {
+        // No embedded SCT. With ct_pinned, this is the missing-SCT refusal case.
+        let keys = if p.ct_pinned {
+            let (ct_sk, log_id) = mk_ct_key();
+            vec![CtLogKey {
+                key: *ct_sk.verifying_key(),
+                log_id,
+                valid_for: OPEN_WINDOW,
+            }]
+        } else {
+            vec![]
+        };
+        (mk(None), keys)
+    };
+
+    let alt_cert_der = root_der.clone();
     use p256::pkcs8::DecodePrivateKey;
     let leaf_sk = p256::ecdsa::SigningKey::from_pkcs8_pem(&leaf_key.serialize_pem()).unwrap();
     let rekor_sk = p256::ecdsa::SigningKey::random(&mut rand_core::OsRng);
@@ -172,6 +314,7 @@ fn build(p: Params) -> Fixture {
             key: *rekor_sk.verifying_key(),
             valid_for: OPEN_WINDOW,
         }],
+        ctlog_keys,
     };
 
     Fixture {
@@ -184,10 +327,14 @@ fn build(p: Params) -> Fixture {
                     .into(),
             source_repo_uri: REPO.into(),
             build_type: BUILD_TYPE.into(),
+            // The tamper matrix pins no CT log; the dedicated CT-requirement test
+            // uses the production policy (require = true) instead.
+            require_certificate_transparency: false,
         },
         leaf_sk,
         rekor_sk,
         leaf_der,
+        alt_cert_der,
         p,
     }
 }
@@ -213,15 +360,38 @@ impl Fixture {
         })
     }
 
+    /// The base64-of-PEM cert the Rekor body embeds (the signing leaf, or — for
+    /// the cross-bind negative — a different valid cert).
+    fn body_cert_b64(&self) -> String {
+        let der = if self.p.wrong_body_cert {
+            &self.alt_cert_der
+        } else {
+            &self.leaf_der
+        };
+        b64(pem_of(der).as_bytes())
+    }
+
     /// cosign blob-signature bundle over `binary`.
     fn blob_bundle(&self, binary: &[u8]) -> Bundle {
+        Bundle::parse(self.blob_bundle_value(binary).to_string().as_bytes()).unwrap()
+    }
+
+    fn blob_bundle_value(&self, binary: &[u8]) -> Value {
         let digest = Sha256::digest(binary);
         let sig: p256::ecdsa::Signature = self.leaf_sk.sign(binary);
-        let body = format!(
-            r#"{{"kind":"hashedrekord","spec":{{"data":{{"hash":{{"algorithm":"sha256","value":"{}"}}}}}}}}"#,
-            to_hex(&digest)
-        );
-        let v = json!({
+        let body = json!({
+            "kind": "hashedrekord",
+            "apiVersion": "0.0.1",
+            "spec": {
+                "signature": {
+                    "content": b64(sig.to_der().as_bytes()),
+                    "publicKey": { "content": self.body_cert_b64() },
+                },
+                "data": { "hash": { "algorithm": "sha256", "value": to_hex(&digest) } },
+            },
+        })
+        .to_string();
+        json!({
             "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
             "verificationMaterial": {
                 "certificate": { "rawBytes": b64(&self.leaf_der) },
@@ -231,12 +401,15 @@ impl Fixture {
                 "messageDigest": { "algorithm": "SHA2_256", "digest": b64(&digest) },
                 "signature": b64(sig.to_der().as_bytes()),
             },
-        });
-        Bundle::parse(v.to_string().as_bytes()).unwrap()
+        })
     }
 
     /// SLSA provenance attestation bundle attesting `binary`.
     fn prov_bundle(&self, binary: &[u8]) -> Bundle {
+        Bundle::parse(self.prov_bundle_value(binary).to_string().as_bytes()).unwrap()
+    }
+
+    fn prov_bundle_value(&self, binary: &[u8]) -> Value {
         let digest_hex = to_hex(&Sha256::digest(binary));
         let statement = json!({
             "_type": "https://in-toto.io/Statement/v1",
@@ -261,10 +434,16 @@ impl Fixture {
         } else {
             payload_digest_hex
         };
-        let body = format!(
-            r#"{{"kind":"dsse","spec":{{"payloadHash":{{"algorithm":"sha256","value":"{bound}"}}}}}}"#
-        );
-        let v = json!({
+        let body = json!({
+            "kind": "dsse",
+            "apiVersion": "0.0.1",
+            "spec": {
+                "payloadHash": { "algorithm": "sha256", "value": bound },
+                "signatures": [ { "signature": b64(sig.to_der().as_bytes()), "verifier": self.body_cert_b64() } ],
+            },
+        })
+        .to_string();
+        json!({
             "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
             "verificationMaterial": {
                 "certificate": { "rawBytes": b64(&self.leaf_der) },
@@ -275,8 +454,7 @@ impl Fixture {
                 "payloadType": payload_type,
                 "signatures": [ { "sig": b64(sig.to_der().as_bytes()) } ],
             },
-        });
-        Bundle::parse(v.to_string().as_bytes()).unwrap()
+        })
     }
 
     fn verify(&self, binary: &[u8]) -> Result<VerifiedRelease, VerifyError> {
@@ -451,6 +629,180 @@ fn refuses_untrusted_rekor_key() {
     assert!(matches!(err, VerifyError::Transparency(_)), "got {err:?}");
 }
 
+// --- Certificate transparency: the leaf's embedded SCT (RFC 6962) must verify
+// under a pinned CT log, or the release is refused (a rogue Fulcio can't sign
+// off-log). The fixture signs the SCT over an INDEPENDENTLY-built precert, so a
+// passing accept also proves the verifier's precert reconstruction is byte-exact.
+
+#[test]
+fn accepts_valid_embedded_sct() {
+    let f = build(Params {
+        ct_pinned: true,
+        embed_sct: true,
+        ..Default::default()
+    });
+    f.verify(&f.binary)
+        .expect("a leaf with a valid embedded SCT under a pinned CT log must verify");
+}
+
+#[test]
+fn refuses_missing_sct_when_ct_pinned() {
+    let f = build(Params {
+        ct_pinned: true,
+        embed_sct: false,
+        ..Default::default()
+    });
+    let err = f.verify(&f.binary).unwrap_err();
+    assert!(matches!(err, VerifyError::Sct(_)), "got {err:?}");
+}
+
+#[test]
+fn refuses_sct_signed_by_unpinned_ct_key() {
+    let f = build(Params {
+        ct_pinned: true,
+        embed_sct: true,
+        sct_wrong_key: true,
+        ..Default::default()
+    });
+    let err = f.verify(&f.binary).unwrap_err();
+    assert!(matches!(err, VerifyError::Sct(_)), "got {err:?}");
+}
+
+/// No CT log pinned ⇒ SCT not enforced (matches sigstore-go): a leaf without an
+/// SCT still verifies **under a policy that does not require CT**. The production
+/// trust root pins one, so this is not a bypass — it is the "operator hasn't
+/// configured CT" posture for a custom deployment.
+#[test]
+fn no_ct_pinned_does_not_require_sct() {
+    let f = build(Params::default());
+    assert!(f.trust.ctlog_keys.is_empty());
+    assert!(!f.policy.require_certificate_transparency);
+    f.verify(&f.binary)
+        .expect("no pinned CT log ⇒ SCT optional");
+}
+
+/// The pinned production identity must NOT be silently degradable: a
+/// `trusted_root.json` with no CT-log keys is refused, so SCT hardening cannot be
+/// turned off by shipping a ctlog-less anchor. A1 defense-in-depth
+/// (F-supplychain-ctlogs-required-1).
+#[test]
+fn refuses_pinned_identity_when_trust_root_pins_no_ctlogs() {
+    let f = build(Params::default()); // identity == production; trust pins no ctlogs
+    assert!(f.trust.ctlog_keys.is_empty());
+    let prod = VerificationPolicy::sessionlayer_agent();
+    assert!(prod.require_certificate_transparency);
+    let err = verify_binary(
+        &f.binary,
+        &f.blob_bundle(&f.binary),
+        &f.prov_bundle(&f.binary),
+        &prod,
+        &f.trust,
+    )
+    .unwrap_err();
+    assert!(matches!(err, VerifyError::Sct(_)), "got {err:?}");
+}
+
+/// Declared-but-UNUSABLE ctlogs must FAIL TO LOAD, not silently disable SCT: a
+/// trust root that declares a ctlog whose key is a valid P-384 SPKI (a CT key type
+/// this P-256 parser can't decode — the realistic Sigstore-rotation case) is
+/// refused at load (Sec-F1 / F-supplychain-ctlogs-required-1).
+#[test]
+fn refuses_trust_root_that_declares_unusable_ctlogs() {
+    let f = build(Params::default());
+    let window = json!({ "start": "2020-01-01T00:00:00.000Z" });
+    let certs: Vec<Value> = f
+        .trust
+        .fulcio_cas
+        .iter()
+        .map(|ca| json!({ "rawBytes": b64(&ca.der) }))
+        .collect();
+    let rekor_spki = f.trust.rekor_keys[0].key.to_public_key_der().unwrap();
+    let p384 = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+    let p384_spki = pem::parse(p384.public_key_pem())
+        .unwrap()
+        .contents()
+        .to_vec();
+    let tr = json!({
+        "tlogs": [ { "publicKey": {
+            "rawBytes": b64(rekor_spki.as_bytes()),
+            "keyDetails": "PKIX_ECDSA_P256_SHA_256",
+            "validFor": window,
+        } } ],
+        "certificateAuthorities": [ {
+            "certChain": { "certificates": certs },
+            "validFor": window,
+        } ],
+        "ctlogs": [ { "publicKey": {
+            "rawBytes": b64(&p384_spki),
+            "keyDetails": "PKIX_ECDSA_P384_SHA_384",
+            "validFor": window,
+        } } ],
+    });
+    let loaded = TrustRoot::from_trusted_root_json(&serde_json::to_vec(&tr).unwrap());
+    assert!(
+        matches!(loaded, Err(VerifyError::TrustAnchor(_))),
+        "a trust root that declares an unusable CT log must fail to load"
+    );
+}
+
+// --- Leaf ⇄ Rekor-body cross-bind: the cert embedded in the log entry body must
+// be the very leaf that signed the artifact.
+
+#[test]
+fn refuses_body_cert_not_the_signing_leaf() {
+    let f = build(Params {
+        wrong_body_cert: true,
+        ..Default::default()
+    });
+    let err = f.verify(&f.binary).unwrap_err();
+    assert!(matches!(err, VerifyError::Transparency(_)), "got {err:?}");
+}
+
+/// Ground truth for the RFC 6962 precert: stripping the SCT extension from a final
+/// leaf must byte-equal an independently-built leaf that never carried it (same
+/// fixed serial, same other extensions). This isolates the DER surgery from the
+/// signature check.
+#[test]
+fn precert_reconstruction_strips_only_the_sct_extension() {
+    let (ca_params, ca_key) = ca("Recon CA", &rcgen::PKCS_ECDSA_P384_SHA384);
+    let issuer = Issuer::new(ca_params, ca_key);
+    let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let serial = SerialNumber::from(0x0102_0304_0506_0708u64);
+    let mk = |with_sct: bool| -> Vec<u8> {
+        let mut leaf = CertificateParams::new(Vec::<String>::new()).unwrap();
+        leaf.distinguished_name.push(DnType::CommonName, "sigstore");
+        leaf.serial_number = Some(serial.clone());
+        leaf.subject_alt_names = vec![SanType::URI(
+            Ia5String::try_from("https://example/x".to_string()).unwrap(),
+        )];
+        leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::CodeSigning];
+        let mut exts = vec![CustomExtension::from_oid_content(
+            &[1, 3, 6, 1, 4, 1, 57264, 1, 8],
+            der_utf8("iss"),
+        )];
+        if with_sct {
+            exts.push(CustomExtension::from_oid_content(
+                SCT_OID,
+                vec![0x04, 0x02, 0xde, 0xad],
+            ));
+        }
+        leaf.custom_extensions = exts;
+        leaf.signed_by(&key, &issuer).unwrap().der().to_vec()
+    };
+    let oid_der = [
+        0x06u8, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0xd6, 0x79, 0x02, 0x04, 0x02,
+    ];
+    let reconstructed = super::der::remove_extension(
+        &super::der::tbs_of_certificate(&mk(true)).unwrap(),
+        &oid_der,
+    )
+    .unwrap();
+    assert_eq!(
+        reconstructed,
+        super::der::tbs_of_certificate(&mk(false)).unwrap()
+    );
+}
+
 impl Fixture {
     fn verify_default(&self) -> Result<VerifiedRelease, VerifyError> {
         self.verify(&self.binary)
@@ -462,7 +814,6 @@ impl Fixture {
     /// `TrustRoot`. `*_end` is the optional window upper bound (RFC3339); `None`
     /// = open-ended, which must remain "still valid".
     fn trusted_root_json(&self, rekor_end: Option<&str>, ca_end: Option<&str>) -> Vec<u8> {
-        use p256::pkcs8::EncodePublicKey;
         let window = |end: Option<&str>| {
             let mut m = json!({ "start": "2020-01-01T00:00:00.000Z" });
             if let Some(e) = end {
@@ -501,6 +852,37 @@ impl Fixture {
             &self.policy,
             trust,
         )
+    }
+
+    /// A full production-shaped `trusted_root.json` (Fulcio CAs + Rekor tlog key +
+    /// CT-log key), all open-ended — used to freeze the golden fixture.
+    fn golden_trusted_root_json(&self) -> Vec<u8> {
+        let window = json!({ "start": "2020-01-01T00:00:00.000Z" });
+        let certs: Vec<Value> = self
+            .trust
+            .fulcio_cas
+            .iter()
+            .map(|ca| json!({ "rawBytes": b64(&ca.der) }))
+            .collect();
+        let rekor_spki = self.trust.rekor_keys[0].key.to_public_key_der().unwrap();
+        let ct_spki = self.trust.ctlog_keys[0].key.to_public_key_der().unwrap();
+        let v = json!({
+            "tlogs": [ { "publicKey": {
+                "rawBytes": b64(rekor_spki.as_bytes()),
+                "keyDetails": "PKIX_ECDSA_P256_SHA_256",
+                "validFor": window,
+            } } ],
+            "certificateAuthorities": [ {
+                "certChain": { "certificates": certs },
+                "validFor": window,
+            } ],
+            "ctlogs": [ { "publicKey": {
+                "rawBytes": b64(ct_spki.as_bytes()),
+                "keyDetails": "PKIX_ECDSA_P256_SHA_256",
+                "validFor": window,
+            } } ],
+        });
+        serde_json::to_vec_pretty(&v).unwrap()
     }
 }
 
@@ -624,5 +1006,152 @@ fn install_writes_verified_bytes_under_concurrent_mutation() {
     assert!(
         ok_installs > 0,
         "the race never let a valid install through — test ineffective"
+    );
+}
+
+// --- Golden fixture: a committed, real-schema Sigstore bundle (public material
+// only — the ephemeral signing keys are discarded) driven end-to-end through the
+// file-based verify path, plus a single-field tamper battery. Proof the whole
+// chain composes on frozen data, not only on synthetic vectors.
+
+const GOLDEN_DIR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/supply_chain/testdata/golden"
+);
+
+/// Regenerate the committed golden fixture (opt-in via `SL_REGEN_GOLDEN`). Writes
+/// only public certs/signatures/SET/SCT; the signing keys never leave this test.
+#[test]
+fn regenerate_golden_fixture() {
+    if std::env::var_os("SL_REGEN_GOLDEN").is_none() {
+        return;
+    }
+    let f = build(Params {
+        ct_pinned: true,
+        embed_sct: true,
+        ..Default::default()
+    });
+    std::fs::create_dir_all(GOLDEN_DIR).unwrap();
+    std::fs::write(format!("{GOLDEN_DIR}/agent-binary"), &f.binary).unwrap();
+    std::fs::write(
+        format!("{GOLDEN_DIR}/agent.cosign.sigstore.json"),
+        serde_json::to_vec_pretty(&f.blob_bundle_value(&f.binary)).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        format!("{GOLDEN_DIR}/agent.provenance.sigstore.json"),
+        serde_json::to_vec_pretty(&f.prov_bundle_value(&f.binary)).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        format!("{GOLDEN_DIR}/trusted_root.json"),
+        f.golden_trusted_root_json(),
+    )
+    .unwrap();
+}
+
+fn golden_bytes(name: &str) -> Vec<u8> {
+    std::fs::read(format!("{GOLDEN_DIR}/{name}"))
+        .unwrap_or_else(|e| panic!("golden {name}: {e} (run with SL_REGEN_GOLDEN=1 to create)"))
+}
+
+fn golden_json(name: &str) -> Value {
+    serde_json::from_slice(&golden_bytes(name)).unwrap()
+}
+
+/// Verify a (possibly tampered) golden triple through the real file-based path,
+/// under the PRODUCTION identity policy.
+fn run_golden(
+    binary: &[u8],
+    blob: &Value,
+    prov: &Value,
+    trust: &TrustRoot,
+) -> Result<VerifiedRelease, VerifyError> {
+    let tmp = tempfile::tempdir().unwrap();
+    let bp = tmp.path().join("agent");
+    let blp = tmp.path().join("blob.json");
+    let pvp = tmp.path().join("prov.json");
+    std::fs::write(&bp, binary).unwrap();
+    std::fs::write(&blp, blob.to_string()).unwrap();
+    std::fs::write(&pvp, prov.to_string()).unwrap();
+    verify_files(
+        &bp,
+        &blp,
+        &pvp,
+        trust,
+        &VerificationPolicy::sessionlayer_agent(),
+    )
+}
+
+/// Flip one byte inside a base64 JSON field — leaves the JSON structure intact so
+/// the CRYPTO, not the parser, must reject it.
+fn flip_b64(v: &mut Value, ptr: &str) {
+    let s = v
+        .pointer(ptr)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("no field {ptr}"))
+        .to_string();
+    let mut raw = base64::engine::general_purpose::STANDARD
+        .decode(s.trim())
+        .unwrap();
+    let i = raw.len() / 2;
+    raw[i] ^= 0x01;
+    *v.pointer_mut(ptr).unwrap() = Value::String(b64(&raw));
+}
+
+#[test]
+fn golden_bundle_verifies_and_rejects_tampering() {
+    let binary = golden_bytes("agent-binary");
+    let blob = golden_json("agent.cosign.sigstore.json");
+    let prov = golden_json("agent.provenance.sigstore.json");
+    let trust = TrustRoot::from_trusted_root_json(&golden_bytes("trusted_root.json"))
+        .expect("golden trusted_root.json loads");
+    assert!(
+        !trust.ctlog_keys.is_empty(),
+        "golden must pin a CT log so the SCT path is exercised"
+    );
+
+    // Untampered: the whole chain composes on frozen, real-schema data.
+    let rel = run_golden(&binary, &blob, &prov, &trust).expect("golden bundle must verify");
+    assert_eq!(rel.version.as_deref(), Some("1.2.3"));
+
+    // Tamper battery — each single-field mutation is refused (fail closed).
+    let cert = "/verificationMaterial/certificate/rawBytes";
+    let set = "/verificationMaterial/tlogEntries/0/inclusionPromise/signedEntryTimestamp";
+    for ptr in [cert, set] {
+        let mut b = blob.clone();
+        flip_b64(&mut b, ptr);
+        assert!(
+            run_golden(&binary, &b, &prov, &trust).is_err(),
+            "tampered blob {ptr} must be refused"
+        );
+        let mut p = prov.clone();
+        flip_b64(&mut p, ptr);
+        assert!(
+            run_golden(&binary, &blob, &p, &trust).is_err(),
+            "tampered prov {ptr} must be refused"
+        );
+    }
+
+    let mut b = blob.clone();
+    flip_b64(&mut b, "/messageSignature/messageDigest/digest");
+    assert!(
+        run_golden(&binary, &b, &prov, &trust).is_err(),
+        "tampered artifact digest must be refused"
+    );
+
+    let mut p = prov.clone();
+    flip_b64(&mut p, "/dsseEnvelope/payload");
+    assert!(
+        run_golden(&binary, &blob, &p, &trust).is_err(),
+        "tampered provenance payload must be refused"
+    );
+
+    let mut bin = binary.clone();
+    let i = bin.len() / 2;
+    bin[i] ^= 0x01;
+    assert!(
+        run_golden(&bin, &blob, &prov, &trust).is_err(),
+        "tampered binary must be refused"
     );
 }

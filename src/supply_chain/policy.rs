@@ -20,6 +20,12 @@ pub struct VerificationPolicy {
     pub source_repo_uri: String,
     /// The SLSA provenance build type.
     pub build_type: String,
+    /// Refuse if the pinned trust root pins **no** CT-log key, so a ctlog-less
+    /// `trusted_root.json` cannot silently make SCT verification inert (a
+    /// rogue-Fulcio-off-log cert would then slip through undetected). On for the
+    /// pinned production identity; relaxed for a custom `--expect-*` deployment
+    /// that may not run a CT log.
+    pub require_certificate_transparency: bool,
 }
 
 impl VerificationPolicy {
@@ -32,6 +38,7 @@ impl VerificationPolicy {
                     .into(),
             source_repo_uri: "https://github.com/SessionLayer/Agent".into(),
             build_type: "https://actions.github.io/buildtypes/workflow/v1".into(),
+            require_certificate_transparency: true,
         }
     }
 

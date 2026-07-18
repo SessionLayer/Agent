@@ -126,12 +126,17 @@ Landlock net remains valuable as an in-process port backstop even against a
 Landlock-unaware compromise; the prose (`hardening.rs`, README, deploy docs) states
 the confinement accurately (TCP-connect-port on ≥6.7), not as absolute pivot-proofing.
 
-## Note — aarch64 allow-list is CI-unproven (F7)
+## Note — aarch64 build proven at CI (S24); runtime allow-list still x86_64-run
 The seccomp allow-list is shared across x86_64 + aarch64 (the `ioctl`/FIONREAD fix
-lives in the common list), but CI runs on **x86_64 only**. glibc's syscall footprint
-differs by arch (e.g. `arch_prctl` is x86_64-only; aarch64 lacks the legacy
-non-`*at` forms). If aarch64 images ship, the hardened Docker E2E + `seccomp_kill` /
-DNS guards MUST run on an aarch64 runner before relying on the KILL-default there.
+lives in the common list). **S24 adds a build-level arm64 proof to CI**
+(`cargo check --target aarch64-unknown-linux-gnu`, ci.yml — cross linker +
+`libc6-dev-arm64-cross`), closing the "does it even compile on arm64" gap (carry-
+forward B4). Locally reproduced green on this x86_64 box via the same cross target.
+The remaining, deliberately-scoped caveat: glibc's *syscall* footprint differs by
+arch (e.g. `arch_prctl` is x86_64-only; aarch64 lacks the legacy non-`*at` forms), so
+the seccomp KILL-default's runtime *completeness* on arm64 is still exercised only on
+x86_64. When aarch64 images ship, the hardened Docker E2E + `seccomp_kill` / DNS
+guards MUST run on an aarch64 runner before relying on KILL-default there.
 
 ## Verification
 - `tests/seccomp_kill.rs` — a disallowed syscall is SIGSYS-killed; an allowed one
