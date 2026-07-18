@@ -10,13 +10,13 @@ use p256::ecdsa::signature::Verifier;
 
 use super::bundle::TlogEntry;
 use super::error::VerifyError;
+use super::trust::RekorKey;
 
-/// Verify the SET under any pinned Rekor key and return the trusted
-/// `integratedTime`.
-pub fn verify_set(
-    entry: &TlogEntry,
-    rekor_keys: &[p256::ecdsa::VerifyingKey],
-) -> Result<i64, VerifyError> {
+/// Verify the SET under any pinned Rekor key **whose `validFor` window contains
+/// the entry's `integratedTime`**, and return that trusted time. The window
+/// check is what stops a retired-then-compromised bare log key (no X.509
+/// validity of its own) from minting a SET for a fresh signing event.
+pub fn verify_set(entry: &TlogEntry, rekor_keys: &[RekorKey]) -> Result<i64, VerifyError> {
     let integrated_time = entry.integrated_time()?;
     let log_index: i64 = entry
         .log_index
@@ -38,13 +38,25 @@ pub fn verify_set(
     let sig = p256::ecdsa::Signature::from_der(&entry.set_signature()?)
         .map_err(|e| VerifyError::Transparency(format!("SET signature DER: {e}")))?;
 
-    let ok = rekor_keys
-        .iter()
-        .any(|k| k.verify(payload.as_bytes(), &sig).is_ok());
+    let mut sig_ok_but_retired = false;
+    let ok = rekor_keys.iter().any(|rk| {
+        if rk.key.verify(payload.as_bytes(), &sig).is_ok() {
+            if rk.valid_for.contains(integrated_time) {
+                return true;
+            }
+            sig_ok_but_retired = true;
+        }
+        false
+    });
     if !ok {
-        return Err(VerifyError::Transparency(
-            "SignedEntryTimestamp does not verify under any pinned Rekor key".into(),
-        ));
+        return Err(VerifyError::Transparency(if sig_ok_but_retired {
+            format!(
+                "SignedEntryTimestamp verifies but the Rekor key was outside its trusted-root \
+                 validity window at log time {integrated_time} (retired key)"
+            )
+        } else {
+            "SignedEntryTimestamp does not verify under any pinned Rekor key".into()
+        }));
     }
     Ok(integrated_time)
 }

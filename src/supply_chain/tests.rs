@@ -18,7 +18,15 @@ use rcgen::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use super::trust::{FulcioCa, RekorKey, TimeRange};
 use super::*;
+
+/// A `validFor` window that contains every fixture's `LOG_TIME` — the default so
+/// the pre-existing tamper matrix is unaffected by window enforcement.
+const OPEN_WINDOW: TimeRange = TimeRange {
+    start: 0,
+    end: None,
+};
 
 const ISSUER: &str = "https://token.actions.githubusercontent.com";
 const REPO: &str = "https://github.com/SessionLayer/Agent";
@@ -150,8 +158,20 @@ fn build(p: Params) -> Fixture {
     let rekor_sk = p256::ecdsa::SigningKey::random(&mut rand_core::OsRng);
 
     let trust = TrustRoot {
-        fulcio_cas: vec![root_der, inter_der],
-        rekor_keys: vec![*rekor_sk.verifying_key()],
+        fulcio_cas: vec![
+            FulcioCa {
+                der: root_der,
+                valid_for: OPEN_WINDOW,
+            },
+            FulcioCa {
+                der: inter_der,
+                valid_for: OPEN_WINDOW,
+            },
+        ],
+        rekor_keys: vec![RekorKey {
+            key: *rekor_sk.verifying_key(),
+            valid_for: OPEN_WINDOW,
+        }],
     };
 
     Fixture {
@@ -423,8 +443,10 @@ fn refuses_set_not_bound_to_artifact() {
 fn refuses_untrusted_rekor_key() {
     // The bundle's SET is signed by a key not in the trust root.
     let mut f = build(Params::default());
-    f.trust.rekor_keys =
-        vec![*p256::ecdsa::SigningKey::random(&mut rand_core::OsRng).verifying_key()];
+    f.trust.rekor_keys = vec![RekorKey {
+        key: *p256::ecdsa::SigningKey::random(&mut rand_core::OsRng).verifying_key(),
+        valid_for: OPEN_WINDOW,
+    }];
     let err = f.verify(&f.binary).unwrap_err();
     assert!(matches!(err, VerifyError::Transparency(_)), "got {err:?}");
 }
@@ -433,6 +455,92 @@ impl Fixture {
     fn verify_default(&self) -> Result<VerifiedRelease, VerifyError> {
         self.verify(&self.binary)
     }
+
+    /// Re-emit this fixture's real Fulcio chain + Rekor key as a
+    /// `trusted_root.json`, so the `validFor` tests exercise the *actual*
+    /// RFC3339-window parse + enforcement path end to end, not a hand-built
+    /// `TrustRoot`. `*_end` is the optional window upper bound (RFC3339); `None`
+    /// = open-ended, which must remain "still valid".
+    fn trusted_root_json(&self, rekor_end: Option<&str>, ca_end: Option<&str>) -> Vec<u8> {
+        use p256::pkcs8::EncodePublicKey;
+        let window = |end: Option<&str>| {
+            let mut m = json!({ "start": "2020-01-01T00:00:00.000Z" });
+            if let Some(e) = end {
+                m["end"] = json!(e);
+            }
+            m
+        };
+        let certs: Vec<Value> = self
+            .trust
+            .fulcio_cas
+            .iter()
+            .map(|ca| json!({ "rawBytes": b64(&ca.der) }))
+            .collect();
+        let spki = self.trust.rekor_keys[0].key.to_public_key_der().unwrap();
+        let v = json!({
+            "tlogs": [ {
+                "publicKey": {
+                    "rawBytes": b64(spki.as_bytes()),
+                    "keyDetails": "PKIX_ECDSA_P256_SHA_256",
+                    "validFor": window(rekor_end),
+                }
+            } ],
+            "certificateAuthorities": [ {
+                "certChain": { "certificates": certs },
+                "validFor": window(ca_end),
+            } ],
+        });
+        serde_json::to_vec(&v).unwrap()
+    }
+
+    fn verify_with(&self, trust: &TrustRoot) -> Result<VerifiedRelease, VerifyError> {
+        verify_binary(
+            &self.binary,
+            &self.blob_bundle(&self.binary),
+            &self.prov_bundle(&self.binary),
+            &self.policy,
+            trust,
+        )
+    }
+}
+
+// --- Sigstore `validFor` windows (F-supplychain-validfor-1). LOG_TIME is
+// 2027-01-15T08:00:00Z; the retired windows end one second before it.
+
+/// Positive control: `integratedTime` inside both windows AND an ABSENT `end`
+/// (open-ended) must be accepted — proves absent-end means "still valid", so the
+/// enforcement introduces no false refusal on a current trust root.
+#[test]
+fn accepts_when_log_time_in_all_windows_open_ended() {
+    let f = build(Params::default());
+    let trust = TrustRoot::from_trusted_root_json(&f.trusted_root_json(None, None))
+        .expect("open-ended windows load");
+    f.verify_with(&trust)
+        .expect("log time inside both open-ended windows must verify");
+}
+
+/// A SET signed by a Rekor key whose `validFor.end` precedes `integratedTime`
+/// (retired-then-compromised bare log key) must be refused.
+#[test]
+fn refuses_retired_rekor_key_window() {
+    let f = build(Params::default());
+    let trust =
+        TrustRoot::from_trusted_root_json(&f.trusted_root_json(Some("2027-01-15T07:59:59Z"), None))
+            .expect("trust root loads");
+    let err = f.verify_with(&trust).unwrap_err();
+    assert!(matches!(err, VerifyError::Transparency(_)), "got {err:?}");
+}
+
+/// A candidate whose Fulcio CA `validFor.end` precedes `integratedTime`
+/// (retired-but-unexpired CA) must be refused.
+#[test]
+fn refuses_expired_fulcio_ca_window() {
+    let f = build(Params::default());
+    let trust =
+        TrustRoot::from_trusted_root_json(&f.trusted_root_json(None, Some("2027-01-15T07:59:59Z")))
+            .expect("trust root loads");
+    let err = f.verify_with(&trust).unwrap_err();
+    assert!(matches!(err, VerifyError::CertValidity(_)), "got {err:?}");
 }
 
 // --- The update boundary: an unverified binary is never installed.
