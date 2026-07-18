@@ -131,7 +131,11 @@ fn parse_rfc3339_secs(s: &str) -> Result<i64, VerifyError> {
     if !matches!(b[10], b'T' | b't' | b' ') {
         return Err(bad());
     }
-    let num = |a: usize, z: usize| s.get(a..z).and_then(|v| v.parse::<i64>().ok()).ok_or_else(bad);
+    let num = |a: usize, z: usize| {
+        s.get(a..z)
+            .and_then(|v| v.parse::<i64>().ok())
+            .ok_or_else(bad)
+    };
     let (year, month, day) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
     let (hour, min, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {

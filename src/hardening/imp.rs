@@ -397,7 +397,10 @@ mod tests {
             libc::SYS_rt_sigpending,
             libc::SYS_rt_sigsuspend,
         ] {
-            assert!(allowed.contains(&sc), "syscall {sc} must stay on the allow-list");
+            assert!(
+                allowed.contains(&sc),
+                "syscall {sc} must stay on the allow-list"
+            );
         }
     }
 }
