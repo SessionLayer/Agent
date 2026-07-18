@@ -27,3 +27,5 @@ junit.xml
 *.cdx.json
 *.sigstore.json
 SHA256SUMS
+# ...except the committed golden test fixture (public material only, real schema).
+!src/supply_chain/testdata/golden/*.sigstore.json
