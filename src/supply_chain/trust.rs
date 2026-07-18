@@ -128,6 +128,16 @@ impl TrustRoot {
             }
         }
 
+        if ctlog_keys.is_empty() {
+            // Not fatal here (some private deployments run no CT log); the pinned
+            // production identity turns this into a hard refusal at verify time
+            // (VerificationPolicy::require_certificate_transparency).
+            tracing::warn!(
+                "pinned trusted_root.json contains no CT-log keys — Fulcio SCT verification \
+                 will be skipped unless the verification policy requires it"
+            );
+        }
+
         Ok(Self {
             fulcio_cas,
             rekor_keys,

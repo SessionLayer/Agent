@@ -61,6 +61,17 @@ pub fn verify_binary(
     let digest = Sha256::digest(binary);
     let digest_hex = hex(&digest);
 
+    // Fail closed if the policy requires certificate transparency but the pinned
+    // trust root pins no CT-log key — otherwise a ctlog-less `trusted_root.json`
+    // silently disables SCT verification (F-supplychain-ctlogs-required-1).
+    if policy.require_certificate_transparency && trust.ctlog_keys.is_empty() {
+        return Err(VerifyError::Sct(
+            "policy requires certificate transparency but the pinned trust root pins no CT-log \
+             keys — refusing so SCT verification cannot be silently disabled"
+                .into(),
+        ));
+    }
+
     // (1) The SLSA provenance attestation — identity + what-was-built.
     let (prov_leaf, prov_entry) = verify_identity(provenance_bundle, policy, trust)?;
     let env = provenance_bundle.dsse_envelope.as_ref().ok_or_else(|| {

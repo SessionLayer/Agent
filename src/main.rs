@@ -104,6 +104,9 @@ struct VerifyArgs {
 impl VerifyArgs {
     fn policy(&self) -> VerificationPolicy {
         let mut p = VerificationPolicy::sessionlayer_agent();
+        let overridden = self.expect_source_repo.is_some()
+            || self.expect_workflow_ref_prefix.is_some()
+            || self.expect_oidc_issuer.is_some();
         if let Some(x) = &self.expect_source_repo {
             p.source_repo_uri = x.clone();
         }
@@ -112,6 +115,12 @@ impl VerifyArgs {
         }
         if let Some(x) = &self.expect_oidc_issuer {
             p.oidc_issuer = x.clone();
+        }
+        // A custom (`--expect-*`) identity may target a private Sigstore that runs
+        // no CT log; keep the generic "no ctlogs ⇒ SCT not enforced" behavior for
+        // it. The un-overridden pinned production identity still requires CT.
+        if overridden {
+            p.require_certificate_transparency = false;
         }
         p
     }

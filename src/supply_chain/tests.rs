@@ -327,6 +327,9 @@ fn build(p: Params) -> Fixture {
                     .into(),
             source_repo_uri: REPO.into(),
             build_type: BUILD_TYPE.into(),
+            // The tamper matrix pins no CT log; the dedicated CT-requirement test
+            // uses the production policy (require = true) instead.
+            require_certificate_transparency: false,
         },
         leaf_sk,
         rekor_sk,
@@ -666,14 +669,37 @@ fn refuses_sct_signed_by_unpinned_ct_key() {
 }
 
 /// No CT log pinned ⇒ SCT not enforced (matches sigstore-go): a leaf without an
-/// SCT still verifies. The production trust root pins one, so this is not a
-/// bypass — it is the "operator hasn't configured CT" posture.
+/// SCT still verifies **under a policy that does not require CT**. The production
+/// trust root pins one, so this is not a bypass — it is the "operator hasn't
+/// configured CT" posture for a custom deployment.
 #[test]
 fn no_ct_pinned_does_not_require_sct() {
     let f = build(Params::default());
     assert!(f.trust.ctlog_keys.is_empty());
+    assert!(!f.policy.require_certificate_transparency);
     f.verify(&f.binary)
         .expect("no pinned CT log ⇒ SCT optional");
+}
+
+/// The pinned production identity must NOT be silently degradable: a
+/// `trusted_root.json` with no CT-log keys is refused, so SCT hardening cannot be
+/// turned off by shipping a ctlog-less anchor. A1 defense-in-depth
+/// (F-supplychain-ctlogs-required-1).
+#[test]
+fn refuses_pinned_identity_when_trust_root_pins_no_ctlogs() {
+    let f = build(Params::default()); // identity == production; trust pins no ctlogs
+    assert!(f.trust.ctlog_keys.is_empty());
+    let prod = VerificationPolicy::sessionlayer_agent();
+    assert!(prod.require_certificate_transparency);
+    let err = verify_binary(
+        &f.binary,
+        &f.blob_bundle(&f.binary),
+        &f.prov_bundle(&f.binary),
+        &prod,
+        &f.trust,
+    )
+    .unwrap_err();
+    assert!(matches!(err, VerifyError::Sct(_)), "got {err:?}");
 }
 
 // --- Leaf ⇄ Rekor-body cross-bind: the cert embedded in the log entry body must
