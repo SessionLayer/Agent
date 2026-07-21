@@ -6,14 +6,17 @@ and, on demand, dial-backs and splices a connection to the local `sshd` — so a
 node needs **no inbound holes** and the Gateway never trusts the node on TOFU
 (Design §9.2).
 
-> **Status: Session Twelve — durable identity.** The Agent now **joins** the
-> platform (`TokenJoin` / `OidcJoin` / `MtlsJoin`), receives a **renewable
-> internal mTLS X.509 identity carrying a generation counter**, and keeps it
-> fresh with a renew-ahead loop (persist-before-adopt + single-writer data-dir
-> lock + clone-detecting generation counter) — running **non-root, fail-closed**,
-> one credential **per node** (Design §8, FR-JOIN-1..6, FR-CONN-6). The dial-back
-> **data path** (wire transport, splice to `127.0.0.1:22`) is Session Thirteen.
-> See `CLAUDE.md` for scope.
+The Agent **joins** the platform (`TokenJoin` / `OidcJoin` / `MtlsJoin`),
+receives a **renewable internal mTLS X.509 identity carrying a generation
+counter**, and keeps it fresh with a renew-ahead loop (persist-before-adopt +
+single-writer data-dir lock + clone-detecting generation counter) — running
+**non-root, fail-closed**, one credential **per node** (Design §8,
+FR-JOIN-1..6, FR-CONN-6). On demand it accepts a signed single-use dial-back
+and splices the session to the node's own `127.0.0.1:22`, holding control
+channels to ≥2 failure-domain-diverse Gateways (FR-HA-6). It also verifies its
+own supply chain: `verify` / `update` / `--verify-self` check a binary's
+Sigstore signature + SLSA provenance fully offline against a pinned trusted
+root before anything runs or is installed (NFR-7).
 
 ## Security posture
 
@@ -78,6 +81,14 @@ copies** of the canonical protos (`common.proto` + `agent.proto`, the
 `AgentIdentity` service) from `ControlPlane-API/contracts/proto/...`. Keep them
 in sync with `scripts/sync-contracts.sh` (`--check` to verify). The Agent↔Gateway
 dial-back wire protocol (S13) is specified in `contracts/wire/agent-gateway-v1.md`.
+
+## Documentation
+
+Operator and user documentation for the whole platform lives in the
+[Documentation repository](https://github.com/SessionLayer/Documentation) —
+installation, join methods, the supply-chain verification story, and the Agent
+runbook. Component-local: [`RUNBOOK.md`](RUNBOOK.md) (log reasons, exit codes
+3=clone / 4=repair) and [`deploy/`](deploy/).
 
 ## License
 
