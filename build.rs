@@ -3,7 +3,7 @@
 //! The Agent is **contract-first** (Design §13, FR-API-1): it does not
 //! hand-write the shared message types or gRPC stubs, it generates them from a
 //! byte-identical vendored copy of the canonical protos (see
-//! `scripts/sync-contracts.sh` and CLAUDE.md "Contract vendoring").
+//! `scripts/vendor-contracts.sh` and CLAUDE.md "Contract vendoring").
 //!
 //! - `common.proto` — the shared messages (`ProtocolVersion`, `ComponentInfo`);
 //!   no service.

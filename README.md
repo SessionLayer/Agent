@@ -78,8 +78,10 @@ scripts/verify-nonroot-image.sh     # build + assert the runtime USER is non-roo
 
 The Agent generates its types + gRPC stubs from byte-identical **vendored
 copies** of the canonical protos (`common.proto` + `agent.proto`, the
-`AgentIdentity` service) from `ControlPlane-API/contracts/proto/...`. Keep them
-in sync with `scripts/sync-contracts.sh` (`--check` to verify). The Agent↔Gateway
+`AgentIdentity` service) from the public
+[SessionLayer/Contracts](https://github.com/SessionLayer/Contracts) repo, pinned
+by `contracts.lock`. Keep them in sync with `scripts/vendor-contracts.sh`
+(`--check` to verify; CI runs it). The Agent↔Gateway
 dial-back wire protocol (S13) is specified in `contracts/wire/agent-gateway-v1.md`.
 
 ## Documentation
