@@ -5,7 +5,8 @@ Zero-Trust SSH platform. It dials out to failure-domain-diverse Gateways and, on
 demand, dial-backs and splices a connection to the local `sshd` — so a node
 needs **no inbound holes** and the Gateway never trusts the node on TOFU
 (Design §9.2). This repo is one of four (CP, Gateway, **Agent**, Dashboard);
-the canonical cross-repo contracts live in `ControlPlane-API/contracts/`.
+the canonical cross-repo contracts live in the public `SessionLayer/Contracts`
+repo, pinned here via `contracts.lock`.
 
 ---
 
@@ -85,8 +86,12 @@ The Agent is **contract-first** (Design §13, FR-API-1). It does not hand-write
 the shared message types; it generates them from a **byte-identical vendored
 copy** of the canonical proto:
 
-- Source of truth: `ControlPlane-API/contracts/proto/sessionlayer/controlplane/v1/{common,agent}.proto`.
-- Vendored copies (committed): `proto/sessionlayer/controlplane/v1/{common,agent}.proto`.
+- Source of truth: the public `SessionLayer/Contracts` repo
+  (https://github.com/SessionLayer/Contracts), `contracts/proto/...` — pinned by
+  `contracts.lock` (tag + resolved commit SHA) at the repo root.
+- Vendored copies (committed): `proto/sessionlayer/controlplane/v1/{common,agent}.proto`,
+  `proto/sessionlayer/agent/v1/wire.proto`, plus the wire-conformance golden
+  frames at `tests/conformance/frames.json`.
 - `build.rs` runs `tonic-prost-build` over the vendored copies. `common.proto`
   has the shared messages; `agent.proto` (S12) declares the **`AgentIdentity`**
   service (`EnrollAgent`, `RenewAgentIdentity`) — build.rs emits the **client**
@@ -95,13 +100,20 @@ copy** of the canonical proto:
   the future dial-back **data** plane is the framed wire protocol
   (`contracts/wire/agent-gateway-v1.md`, S13).
 
-Why vendor rather than reference across repos: the parent `SessionLayer/` folder
-is intentionally **not** a git repo, and CI checks out this repo alone.
+Why vendor rather than reference across repos: each repo builds standalone, and
+committed vendored copies keep builds reproducible and reviewable.
 
-Keep the copy in sync with `scripts/sync-contracts.sh`:
-- `scripts/sync-contracts.sh` — re-copy from the sibling contracts repo when
-  present (local dev); a documented no-op in CI (source absent).
-- `scripts/sync-contracts.sh --check` — fail if the vendored copy has drifted.
+Keep the copy in sync with `scripts/vendor-contracts.sh`:
+- `scripts/vendor-contracts.sh` — git-clone the tag pinned in `contracts.lock`,
+  verify the resolved commit SHA against the lock (a moved/re-pushed tag fails
+  hard), then re-copy the vendored files.
+- `scripts/vendor-contracts.sh --check` — same clone + SHA verify, then fail if
+  any vendored copy has drifted. CI runs this right after checkout, so drift is
+  a **real** failure there (the old sibling-path sync was a silent no-op in CI).
+
+To adopt a new contracts version: update `contracts.lock` (tag + SHA) in a
+reviewed PR, run `scripts/vendor-contracts.sh`, regenerate with `cargo build`,
+and commit the diff.
 
 **N-1 compatibility (contracts/VERSIONING.md, D33/FR-HA-9):** protocol versions
 are `major.minor`; a component supports peers **one minor back** (`protocol_min`

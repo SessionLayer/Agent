@@ -26,6 +26,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
+      # Real drift gate (unlike the old sibling-path sync, which was a no-op
+      # here): clones SessionLayer/Contracts at the tag pinned in contracts.lock,
+      # verifies the resolved SHA, and diffs the vendored copies.
+      - name: Verify vendored contracts (contracts.lock)
+        run: ./scripts/vendor-contracts.sh --check
+
       - name: Install protoc
         run: |
           sudo apt-get update
