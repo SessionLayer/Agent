@@ -39,7 +39,7 @@ jobs:
           protoc --version
 
       - name: Install Rust toolchain (pinned by rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # pinned commit (action publishes no semver tags)
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # pinned commit (action publishes no semver tags)
         with:
           toolchain: "1.95.0"
           components: rustfmt, clippy
