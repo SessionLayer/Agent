@@ -52,14 +52,21 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-      # SOURCE_DATE_EPOCH (tagged commit) + remapping BOTH the workspace and the
-      # cargo registry out of the binary make it byte-reproducible for an
-      # independent rebuilder on a different $HOME/$CARGO_HOME. (Residual: the std
+      # SOURCE_DATE_EPOCH (tagged commit) + remapping the workspace, the cargo
+      # registry, AND the double-build's alternate $RUNNER_TEMP/repro target dir
+      # (below) out of the binary make it byte-reproducible for an independent
+      # rebuilder on a different $HOME/$CARGO_HOME. The third rule exists because
+      # build.rs (tonic-prost-build) generates code under OUT_DIR — which lives
+      # under the target dir, not under $PWD — and a panic/track_caller location
+      # in that generated code embeds OUT_DIR's absolute path; without this rule
+      # the two builds' target dirs diverge and the digests never match (caught
+      # live: v0.1.0's release run failed on exactly this, fixed forward in
+      # v0.1.1 — see Docs/sessions/thirtyone/RESULT.md). (Residual: the std
       # sysroot path — bounded by pinning the exact toolchain, documented.)
       - name: Compute deterministic build env
         run: |
           echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
-          echo "RUSTFLAGS=--remap-path-prefix=$PWD=/build --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}/registry=/registry" >> "$GITHUB_ENV"
+          echo "RUSTFLAGS=--remap-path-prefix=$PWD=/build --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}/registry=/registry --remap-path-prefix=$RUNNER_TEMP/repro=/build/target" >> "$GITHUB_ENV"
 
       - name: Reproducible release build
         run: cargo build --release --locked --bin "$BIN"
