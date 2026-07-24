@@ -89,7 +89,7 @@ pem = "3"
 # Sigstore-bundle fields. Raw ECDSA (blob/DSSE/Rekor-SET) reuses `p256`. No new
 # licenses (all RustCrypto MIT/Apache-2.0, already allow-listed) and no OpenSSL.
 x509-parser = { version = "0.18", features = ["verify"] }
-sha2 = "0.10"
+sha2 = "0.11"
 base64 = "0.23"
 # Anti-rollback (downgrade protection) for the update path: compare the candidate
 # release's SemVer — extracted from the identity-pinned, Fulcio-signed SAN tag ref
