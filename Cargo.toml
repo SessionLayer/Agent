@@ -90,7 +90,7 @@ pem = "3"
 # licenses (all RustCrypto MIT/Apache-2.0, already allow-listed) and no OpenSSL.
 x509-parser = { version = "0.18", features = ["verify"] }
 sha2 = "0.10"
-base64 = "0.22"
+base64 = "0.23"
 # Anti-rollback (downgrade protection) for the update path: compare the candidate
 # release's SemVer — extracted from the identity-pinned, Fulcio-signed SAN tag ref
 # — against the running version, so a validly-signed *older* (vulnerable) release
