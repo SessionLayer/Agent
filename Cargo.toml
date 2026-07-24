@@ -71,7 +71,7 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"]
 # Proof-of-possession signing for MtlsJoin: the operator pre-provisioned key
 # signs a binding over the enrollment CSR (ECDSA-P256/SHA-256, ASN.1 DER — what
 # the CP verifies with SHA256withECDSA). `pkcs8`/`pem` load the operator key.
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem", "std"] }
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "pkcs8", "pem", "std"] }
 
 # OS RNG for the renew-ahead jitter sample (rand_core 0.6 — aligned with the
 # Gateway; the version rcgen/p256 speak).
