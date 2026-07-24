@@ -115,10 +115,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }} # via env — never interpolate a ref into the shell
         run: |
-          gh release create "$TAG" \
+          # view-then-create, not create-then-swallow-any-error: a bare
+          # `gh release create || echo "already exists"` treats an auth/API
+          # failure identically to "already exists" and proceeds anyway,
+          # producing a confusing failure two steps later at upload instead.
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" \
             --title "Agent $TAG" \
-            --notes "Signed, provenanced, reproducible release. Verify with \`sessionlayer-agent verify\` (NFR-7)." \
-            || echo "release already exists — uploading assets"
+            --notes "Signed, provenanced, reproducible release. Verify with \`sessionlayer-agent verify\` (NFR-7)."
           gh release upload "$TAG" --clobber \
             "$BIN" \
             "${BIN}.cdx.json" \
