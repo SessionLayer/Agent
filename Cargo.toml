@@ -1,0 +1,186 @@
+# SessionLayer Agent — the per-node outbound connector (Design §9.2, §9.3).
+#
+# The Agent holds a durable identity: it JOINS the platform
+# (TokenJoin / OidcJoin / MtlsJoin), receives a renewable internal mTLS X.509
+# identity carrying a generation counter, and keeps it fresh with a renew-ahead
+# loop — running non-root, one credential per node, lockable and clone-detecting
+# (FR-JOIN-1..6, FR-CONN-6). The identity machinery is a deliberate port of the
+# Gateway machinery (Gateway/gateway-core/src/{identity,mtls}.rs).
+#
+# Layout: a SINGLE package that is both a library (`sessionlayer_agent`,
+# src/lib.rs) and a thin binary (`sessionlayer-agent`, src/main.rs) — the library
+# split keeps the identity/join logic unit- and integration-testable without a
+# multi-crate workspace on a shared 2-core builder.
+[package]
+name = "sessionlayer-agent"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.95"
+description = "SessionLayer Agent — per-node outbound connector for the Zero-Trust SSH platform."
+license = "GPL-3.0-only"
+repository = "https://github.com/SessionLayer/Agent"
+readme = "README.md"
+publish = false
+
+[lib]
+name = "sessionlayer_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sessionlayer-agent"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime — plain multi-threaded tokio. The Agent is a control-plane
+# participant, NOT a hot byte-copy datapath: the SSH ciphertext splice is a
+# modest per-session stream, and the platform's high-throughput path lives in
+# the Gateway. `sync`/`time` carry the renew-ahead loop's manual-trigger +
+# shutdown channels; `net`/`io-util` carry the dial-back splice to the node's
+# local sshd.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net", "io-util"] }
+
+# The Agent<->Gateway wire transport: a framed binary protocol over a
+# mutually-authenticated WebSocket (contracts/wire/agent-gateway-v1.md).
+# `tokio-tungstenite` carries NO TLS feature on purpose — we hand it an already
+# established `tokio_rustls` TLS 1.3 stream, so a second TLS backend can never
+# enter the tree (deny.toml bans OpenSSL; the provider is `ring`).
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
+# Sink/Stream combinators for the WebSocket halves (split + backpressured send).
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
+# Generated protobuf message + gRPC client types (from the vendored contract:
+# common.proto + agent.proto). tonic 0.14 split the prost integration into
+# tonic-prost / tonic-prost-build. `tls-ring` builds the tokio-rustls transport
+# on the *ring* provider (no aws-lc-rs C/asm toolchain) — the CP<->Agent mTLS
+# plane. Aligned with the Gateway/CP toolchain.
+tonic = { version = "0.14", features = ["tls-ring"] }
+tonic-prost = "0.14"
+prost = "0.14"
+
+# TLS backend, pinned and installed process-wide at startup (single explicit
+# crypto provider before any TLS is negotiated). ring backend; TLS 1.3-only by
+# construction (no `tls12`) — both ends of the Agent's plane are first-party.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+
+# X.509 identity: local ECDSA P-256 keypair + PKCS#10 CSR generation (the Agent
+# sends only a CSR; its mTLS private key never leaves — D2/§15). `ring` backend
+# (NOT aws_lc_rs); `pem` for the tonic client-identity PEM. Also the mock-CP
+# internal CA in tests.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+
+# Proof-of-possession signing for MtlsJoin: the operator pre-provisioned key
+# signs a binding over the enrollment CSR (ECDSA-P256/SHA-256, ASN.1 DER — what
+# the CP verifies with SHA256withECDSA). `pkcs8`/`pem` load the operator key.
+# `getrandom` is test-only (throwaway keypairs in `supply_chain::tests`, via the
+# `Generate` trait) but is a crate-wide feature, not a per-dependency-set one;
+# p256 0.14 moved its RNG bound to a newer, separate `rand_core` major (0.10,
+# via `elliptic-curve`/`crypto-common`) that our own `rand_core` dependency
+# below does not implement, so `Generate::generate()`'s ambient RNG path is the
+# fix, not a second explicit RNG plumbed through.
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "pkcs8", "pem", "std", "getrandom"] }
+
+# OS RNG for the renew-ahead jitter sample. rand_core 0.6, NOT the same major
+# p256/ecdsa now pull in internally (0.10, self-contained behind p256's own
+# `getrandom` feature above) — the two never need to interoperate.
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# PEM parse/encode (bootstrap CA anchors, DER<->PEM for the tonic Identity).
+pem = "3"
+
+# Supply-chain verify-before-run (NFR-7). A node refuses to run/update
+# to an Agent binary that isn't Sigstore-verified against our release identity.
+# `x509-parser` (promoted from a dev-only rcgen feature to a real dep) parses the
+# Fulcio leaf and — via `verify` (ring backend, already in the tree) — checks the
+# leaf/intermediate signatures chain to the pinned Sigstore root; `sha2` digests
+# the candidate binary (bound to the provenance subject); `base64` decodes the
+# Sigstore-bundle fields. Raw ECDSA (blob/DSSE/Rekor-SET) reuses `p256`. No new
+# licenses (all RustCrypto MIT/Apache-2.0, already allow-listed) and no OpenSSL.
+x509-parser = { version = "0.18", features = ["verify"] }
+sha2 = "0.11"
+base64 = "0.23"
+# Anti-rollback (downgrade protection) for the update path: compare the candidate
+# release's SemVer — extracted from the identity-pinned, Fulcio-signed SAN tag ref
+# — against the running version, so a validly-signed *older* (vulnerable) release
+# can't be forced. MIT/Apache-2.0, already allow-listed.
+semver = "1"
+
+# Single-writer data-dir lock (§8.2): an exclusive advisory lock so two Agent
+# processes can't race the credential / generation counter.
+fd-lock = "4"
+
+# Scrub secrets (mTLS private key, join token) from the heap on drop.
+zeroize = { version = "1", features = ["zeroize_derive"] }
+
+# Structured logging.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# OpenTelemetry tracing (§14, OTEL-CONTRACT §2.2). The Agent mints its own
+# `agent.dial_back` / `agent.splice` (+ enroll/renew) spans and correlates them to
+# the platform trace by the `sessionlayer.session_id` it already holds — it does NOT
+# touch the frozen wire/SLDB1 token. OFF by default: the OTLP exporter layer is only
+# installed when OTEL_EXPORTER_OTLP_ENDPOINT is set; otherwise only the local
+# `tracing`/fmt subscriber runs, unchanged. Export is OTLP/gRPC over tonic on the
+# *ring* TLS backend (`tls-ring`, never native-TLS) so the deny.toml OpenSSL ban
+# holds. Spans carry IDs/enums/durations only — never plaintext/keys/tokens (§5).
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace", "tls-ring"] }
+tracing-opentelemetry = "0.33"
+
+# Config manifest + machine-readable version descriptor.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors: thiserror for the library's typed errors, anyhow for the binary.
+thiserror = "2"
+anyhow = "1"
+
+# CLI.
+clap = { version = "4", features = ["derive"] }
+
+# Effective-UID probe for the non-root fail-closed check (FR-CONN-6). libc is
+# already in the tree transitively via tokio. Also carries the prctl/setrlimit
+# constants the Tier-0 hardening uses (coredump disable).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Tier-0 runtime hardening (NFR-5 / Design §15) — Linux LSM features, and
+# the Agent ships only on Linux (distroless). `seccompiler` builds+installs the
+# seccomp-BPF syscall allow-list (pure Rust — no libseccomp C dependency, one fewer
+# non-Rust supply-chain input than libseccomp). `landlock` applies the filesystem +
+# network-egress rulesets. Both fail closed (a step that cannot apply aborts; a
+# kernel that lacks the LSM is a documented, loud Accepted-Risk degrade).
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "0.5"
+landlock = "0.4"
+
+[build-dependencies]
+# Contract codegen: prost/tonic types from the vendored protos. The AgentIdentity
+# service emits a client (the Agent's enroll/renew calls) and a server (the
+# in-process mock CP in tests).
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "time", "sync", "test-util", "net", "io-util"] }
+# In-process mock CP (a real TLS 1.3 tonic server) + non-root container E2E.
+tokio-stream = { version = "0.1", features = ["net"] }
+tempfile = "3"
+testcontainers = "0.27"
+# The mock CP signs the Agent's CSRs → needs rcgen CSR parsing (`x509-parser`).
+# Kept in dev-deps only: Cargo feature-unification adds it to test builds while
+# the production build (no dev-deps) stays lean (no x509-parser edge). Mirrors
+# the Gateway.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }
+# fork/waitpid/WTERMSIG for the seccomp-enforcement test (a disallowed syscall in a
+# forked child must be KILLED). libc is already a runtime dep on unix.
+libc = "0.2"
+
+[profile.release]
+# Reproducible-build / provenance intent (NFR-7): deterministic, debuginfo-free
+# release artifacts. LTO + single codegen unit for a small, self-contained agent.
+lto = true
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

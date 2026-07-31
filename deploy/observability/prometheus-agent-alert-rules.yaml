@@ -1,0 +1,54 @@
+# SessionLayer Agent — exit-code alert rules (H4).
+#
+# The Agent is outbound-only and exposes no inbound metrics/health endpoint by
+# design (see the Agent runbook's "Observability" section, `docs/operations/agent-runbook.md`
+# in the `SessionLayer/Documentation` repo), so its only orchestration signal is
+# the process exit code. On the shipped DaemonSet, kubelet's restartPolicy MUST
+# be `Always` (the only legal value for a DaemonSet pod) — it will keep
+# restarting the container regardless of exit code, so there is no way to stop
+# it from looping. The fix is not fighting that restart; it's paging on *which*
+# code it exited with (the runbook already says to alert on the exit code).
+#
+# Requires kube-state-metrics scraping this namespace. Without it, exit codes
+# 3/4 are invisible: they show up only in `kubectl describe pod` (last state /
+# exit code) and in the container's own stderr, neither of which pages anyone.
+groups:
+  - name: sessionlayer-agent-exit-codes
+    rules:
+      # SECURITY — generation mismatch (possible clone, FR-JOIN-5). The CP has
+      # already auto-locked the identity; no auto-clear.
+      - alert: AgentPossibleCloneDetected
+        expr: kube_pod_container_status_last_terminated_reason{namespace="sessionlayer",container="agent",reason="Error"}
+          * on(namespace, pod, container) group_left()
+          kube_pod_container_status_last_terminated_exitcode{namespace="sessionlayer",container="agent"} == 3
+        for: 0m
+        labels: { severity: page, security: clone-detection }
+        annotations:
+          summary: "Agent on {{ $labels.pod }} exited 3 (possible clone)"
+          description: "Generation mismatch: the CP auto-locked this identity (§8.2). Do NOT let the orchestrator silently loop past this — treat as a SECURITY incident and re-provision (see the Agent runbook)."
+
+      # Repair-needed — locked identity / unknown-rotated cert / stale
+      # generation, from EITHER a fresh enrollment refusal or a startup renew
+      # refusal (both now classify identically, H4).
+      - alert: AgentIdentityRepairNeeded
+        expr: kube_pod_container_status_last_terminated_reason{namespace="sessionlayer",container="agent",reason="Error"}
+          * on(namespace, pod, container) group_left()
+          kube_pod_container_status_last_terminated_exitcode{namespace="sessionlayer",container="agent"} == 4
+        for: 0m
+        labels: { severity: page }
+        annotations:
+          summary: "Agent on {{ $labels.pod }} exited 4 (repair needed)"
+          description: "The Control Plane refused this identity (locked / unknown-rotated cert / stale generation) — not transient. Re-provision via the join-token API (see the Agent runbook); do not expect this to clear on its own."
+
+      # SATURATION-adjacent — a crash-loop on any OTHER exit code still means
+      # the fleet is losing a node; not security-tagged, but still worth a
+      # human look since exit 1 is the "usually transient" bucket, not "ignore".
+      - alert: AgentCrashLoopingOnTransientExit
+        expr: rate(kube_pod_container_status_restarts_total{namespace="sessionlayer",container="agent"}[15m]) > 0
+          and on(namespace, pod, container)
+          kube_pod_container_status_last_terminated_exitcode{namespace="sessionlayer",container="agent"} == 1
+        for: 15m
+        labels: { severity: warn }
+        annotations:
+          summary: "Agent on {{ $labels.pod }} repeatedly exiting 1 over 15m"
+          description: "Exit 1 is normally transient (CP blip / disk), but a sustained loop means it isn't self-healing — check node connectivity and CP reachability from this node."

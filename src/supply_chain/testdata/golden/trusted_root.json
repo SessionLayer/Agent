@@ -1,0 +1,41 @@
+{
+  "certificateAuthorities": [
+    {
+      "certChain": {
+        "certificates": [
+          {
+            "rawBytes": "MIIBuTCCAT+gAwIBAgIUSib1UVD5TtAwhlxYNGMvHsJTlU0wCgYIKoZIzj0EAwMwGzEZMBcGA1UEAwwQVGVzdCBGdWxjaW8gUm9vdDAgFw0yMDAxMDEwMDAwMDBaGA8yMTAwMDEwMTAwMDAwMFowGzEZMBcGA1UEAwwQVGVzdCBGdWxjaW8gUm9vdDB2MBAGByqGSM49AgEGBSuBBAAiA2IABIZi6bx0VLVXwqlnQuYlKgpKrmzfWrgq0u9Yt9LzXoq914sWFdoskcnC8OlCuo4GU0SXHzBbAf47xMNtaWfP7gTlsnFD7qLAEB9IqyJ4HhoLOvT7rxDOsCkqtuPMEAeWOaNCMEAwDgYDVR0PAQH/BAQDAgEGMB0GA1UdDgQWBBRw6lItR64kedzEszt1iQ525zGp5jAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMDA2gAMGUCME96R5q26vR//pXOMpocMbZMuuZ9jg3G4u3HhvVPc5Xu9yFDEOiMALF+FwHPaKYz4gIxAOWEDJOjqKrrJrBRIgAUh2rATyfHgdJEryGOhvq6GtXkG+1kGrZ+D5hpYotGwgKctw=="
+          },
+          {
+            "rawBytes": "MIIBwTCCAUegAwIBAgIUSmM12CU9vhEsks0rGoZJtHPrMnEwCgYIKoZIzj0EAwMwGzEZMBcGA1UEAwwQVGVzdCBGdWxjaW8gUm9vdDAgFw0yMDAxMDEwMDAwMDBaGA8yMTAwMDEwMTAwMDAwMFowIzEhMB8GA1UEAwwYVGVzdCBGdWxjaW8gSW50ZXJtZWRpYXRlMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEbf6fcmVtxK4DsI97ZXqTHgzt08KWgxWVjHXapRxBOaCiuf7b33yDNexYPdlMdeMO8pJu3Tq/U9nUoMMh4MtE+5XMtRHDceCi1H0a7hgxk5RSZwn4lV4dawGVJ+FruLnno0IwQDAOBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFPyaPiU70iEnunclXcKtf9GW0Ls/MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwMDaAAwZQIxAITBa7FHTUa2UIU1RwfXHgMegBmr1g3+7iowEDlCBg6LDJcS/ZBobCK/d+OLVvWKYgIwQFAyS0gwY//qoRlyuboXwDwVr91s8eHigNYzUiLPh9qNQutOM5iMoKD/eoSL9DN6"
+          }
+        ]
+      },
+      "validFor": {
+        "start": "2020-01-01T00:00:00.000Z"
+      }
+    }
+  ],
+  "ctlogs": [
+    {
+      "publicKey": {
+        "keyDetails": "PKIX_ECDSA_P256_SHA_256",
+        "rawBytes": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEEfvmB0rN1nxTrOy1D8yKoChwRw4I2AUK8Ofgal6A/KnKYFdkbscc+oDklRfjn8fIjA9seMc3uWh1Nb7lsdISrw==",
+        "validFor": {
+          "start": "2020-01-01T00:00:00.000Z"
+        }
+      }
+    }
+  ],
+  "tlogs": [
+    {
+      "publicKey": {
+        "keyDetails": "PKIX_ECDSA_P256_SHA_256",
+        "rawBytes": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE3HnFrKRlhdacHYGCnZnAfSbPK1/0AG/n7jors/mEzKaOQIcMlhEk8YKx69VMuf+UTq9WdaTEMVBio6QDDueM4g==",
+        "validFor": {
+          "start": "2020-01-01T00:00:00.000Z"
+        }
+      }
+    }
+  ]
+}
