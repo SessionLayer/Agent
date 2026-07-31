@@ -20,7 +20,7 @@
 # silently fetches the pinned toolchain over the network — so the drift is
 # invisible while defeating the point of shipping a pinned base image.
 # ---- Builder ---------------------------------------------------------------
-FROM rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS builder
+FROM rust:1.97-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa AS builder
 
 # protoc is required at build time by tonic-build/prost-build to generate the
 # contract types from the vendored common.proto.
