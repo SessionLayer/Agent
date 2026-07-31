@@ -1,0 +1,193 @@
+//! Fulcio leaf: verify chains to pinned root, valid at log time, code-signing cert;
+//! extract identity (SAN, OIDC issuer, source repo). Chain verification via x509-parser + ring.
+
+use x509_parser::prelude::*;
+
+use super::error::VerifyError;
+use super::policy;
+use super::sct;
+use super::trust::{TimeRange, TrustRoot};
+
+pub struct LeafInfo {
+    pub san: Option<String>,
+    pub issuer: Option<String>,
+    pub source_repo: Option<String>,
+    /// SEC1 uncompressed point of the leaf's P-256 key (verifies blob/DSSE sigs).
+    pub public_key_sec1: Vec<u8>,
+}
+
+pub fn parse_and_chain(
+    leaf_der: &[u8],
+    trust: &TrustRoot,
+    at_time: i64,
+) -> Result<LeafInfo, VerifyError> {
+    let (_, leaf) = X509Certificate::from_der(leaf_der)
+        .map_err(|e| VerifyError::Chain(format!("leaf parse: {e}")))?;
+
+    if trust.fulcio_cas.is_empty() {
+        return Err(VerifyError::TrustAnchor(
+            "no pinned Fulcio CA certificates".into(),
+        ));
+    }
+    let cas: Vec<(X509Certificate<'_>, TimeRange)> = trust
+        .fulcio_cas
+        .iter()
+        .map(|ca| {
+            X509Certificate::from_der(&ca.der)
+                .map(|(_, c)| (c, ca.valid_for))
+                .map_err(|e| VerifyError::TrustAnchor(format!("pinned CA parse: {e}")))
+        })
+        .collect::<Result<_, _>>()?;
+
+    let issuer_spki = verify_chain(&leaf, &cas, at_time)?;
+
+    let nb = leaf.validity().not_before.timestamp();
+    let na = leaf.validity().not_after.timestamp();
+    if at_time < nb || at_time > na {
+        return Err(VerifyError::CertValidity(format!(
+            "log time {at_time} outside leaf validity [{nb}, {na}]"
+        )));
+    }
+
+    require_code_signing(&leaf)?;
+    // Prove the CA logged this cert to a pinned CT log (no-op if none pinned).
+    sct::verify_embedded_scts(leaf_der, &leaf, &issuer_spki, &trust.ctlog_keys, at_time)?;
+
+    Ok(LeafInfo {
+        san: extract_san_uri(&leaf),
+        issuer: extract_fulcio_issuer(&leaf),
+        source_repo: extract_fulcio_ext(&leaf, policy::OID_FULCIO_SOURCE_REPO_URI),
+        public_key_sec1: leaf.public_key().subject_public_key.data.to_vec(),
+    })
+}
+
+/// Walk leaf → pinned intermediate → pinned self-signed root, verifying every
+/// issuer signature and CA constraint. Fail closed if any link is missing.
+/// Returns the SubjectPublicKeyInfo DER of the leaf's **direct** issuer (the CT
+/// precert `issuer_key_hash` input).
+fn verify_chain(
+    leaf: &X509Certificate<'_>,
+    cas: &[(X509Certificate<'_>, TimeRange)],
+    at_time: i64,
+) -> Result<Vec<u8>, VerifyError> {
+    let mut current = leaf;
+    let mut leaf_issuer_spki: Option<Vec<u8>> = None;
+    for _ in 0..6 {
+        let (issuer, window) = cas
+            .iter()
+            .find(|(ca, _)| {
+                ca.subject() == current.issuer()
+                    && current.verify_signature(Some(ca.public_key())).is_ok()
+            })
+            .ok_or_else(|| {
+                VerifyError::Chain(format!(
+                    "no pinned issuer for subject {:?}",
+                    current.subject().to_string()
+                ))
+            })?;
+
+        leaf_issuer_spki.get_or_insert_with(|| issuer.public_key().raw.to_vec());
+        require_ca(issuer)?;
+        let inb = issuer.validity().not_before.timestamp();
+        let ina = issuer.validity().not_after.timestamp();
+        if at_time < inb || at_time > ina {
+            return Err(VerifyError::CertValidity(format!(
+                "pinned CA {:?} not valid at log time {at_time}",
+                issuer.subject().to_string()
+            )));
+        }
+        // Enforce validFor window against trusted clock: a retired-but-still-unexpired CA
+        // must not vouch for a fresh signing event.
+        if !window.contains(at_time) {
+            return Err(VerifyError::CertValidity(format!(
+                "pinned CA {:?} outside its trusted-root validity window at log time {at_time}",
+                issuer.subject().to_string()
+            )));
+        }
+
+        if issuer.subject() == issuer.issuer() {
+            issuer
+                .verify_signature(Some(issuer.public_key()))
+                .map_err(|e| VerifyError::Chain(format!("pinned root self-signature: {e}")))?;
+            return Ok(leaf_issuer_spki.expect("at least one issuer walked"));
+        }
+        current = issuer;
+    }
+    Err(VerifyError::Chain("certificate chain too long".into()))
+}
+
+fn require_ca(cert: &X509Certificate<'_>) -> Result<(), VerifyError> {
+    match cert.basic_constraints() {
+        Ok(Some(bc)) if bc.value.ca => Ok(()),
+        _ => Err(VerifyError::Chain(format!(
+            "pinned issuer {:?} is not a CA",
+            cert.subject().to_string()
+        ))),
+    }
+}
+
+fn require_code_signing(leaf: &X509Certificate<'_>) -> Result<(), VerifyError> {
+    match leaf.extended_key_usage() {
+        Ok(Some(eku)) if eku.value.code_signing => Ok(()),
+        _ => Err(VerifyError::NotCodeSigning),
+    }
+}
+
+fn extract_san_uri(leaf: &X509Certificate<'_>) -> Option<String> {
+    let san = leaf.subject_alternative_name().ok().flatten()?;
+    for name in &san.value.general_names {
+        if let GeneralName::URI(uri) = name {
+            return Some((*uri).to_string());
+        }
+    }
+    None
+}
+
+/// The OIDC issuer: prefer the DER-encoded `.1.8`, fall back to the legacy raw
+/// `.1.1`.
+fn extract_fulcio_issuer(leaf: &X509Certificate<'_>) -> Option<String> {
+    extract_fulcio_ext(leaf, policy::OID_FULCIO_ISSUER)
+        .or_else(|| extract_fulcio_ext(leaf, policy::OID_FULCIO_ISSUER_LEGACY))
+}
+
+fn extract_fulcio_ext(leaf: &X509Certificate<'_>, oid: &str) -> Option<String> {
+    for ext in leaf.extensions() {
+        if ext.oid.to_id_string() == oid {
+            return Some(decode_fulcio_string(ext.value));
+        }
+    }
+    None
+}
+
+/// Fulcio's newer extensions wrap the value in a DER UTF8String; the legacy
+/// `.1.1` is a raw string. Accept either.
+fn decode_fulcio_string(v: &[u8]) -> String {
+    der_utf8string(v).unwrap_or_else(|| String::from_utf8_lossy(v).into_owned())
+}
+
+fn der_utf8string(v: &[u8]) -> Option<String> {
+    if v.first() != Some(&0x0c) {
+        return None;
+    }
+    let (len, hdr) = der_len(&v[1..])?;
+    let start = 1usize.checked_add(hdr)?;
+    let end = start.checked_add(len)?;
+    let body = v.get(start..end)?;
+    std::str::from_utf8(body).ok().map(|s| s.to_string())
+}
+
+fn der_len(v: &[u8]) -> Option<(usize, usize)> {
+    let first = *v.first()?;
+    if first & 0x80 == 0 {
+        return Some((first as usize, 1));
+    }
+    let n = (first & 0x7f) as usize;
+    if n == 0 || n > 4 {
+        return None;
+    }
+    let mut len = 0usize;
+    for &b in v.get(1..1 + n)? {
+        len = (len << 8) | b as usize;
+    }
+    Some((len, 1 + n))
+}
