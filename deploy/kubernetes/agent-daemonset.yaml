@@ -30,6 +30,13 @@ spec:
       labels:
         app.kubernetes.io/name: sessionlayer-agent
     spec:
+      # Kubernetes' 30 s default is shorter than this Agent's own shutdown
+      # budget, and the overrun is not a slow drain — a SIGKILL landing in the
+      # credential-persist window leaves a generation the Control Plane reads as
+      # a clone and auto-locks, so a routine node drain becomes a security page
+      # and a manual re-provision. This covers the 30 s drain deadline and the
+      # in-flight renewal underneath it.
+      terminationGracePeriodSeconds: 60
       # Host-key access is root-only on the node; the Agent must never be root.
       hostPID: false
       automountServiceAccountToken: true # OIDC join reads the projected SA token
@@ -66,6 +73,16 @@ spec:
             # OpenTelemetry is OFF unless this is set (OTEL-CONTRACT §6):
             # - name: OTEL_EXPORTER_OTLP_ENDPOINT
             #   value: https://otel-collector.observability:4317
+          # Without requests the Agent lands in BestEffort and is the first thing
+          # the kubelet evicts under node memory pressure — which is when it is
+          # most needed, because an evicted Agent makes its node unreachable
+          # through the platform. Requests only: the Agent's work is bounded by
+          # its channel count, and a memory limit would turn a burst into an
+          # OOMKill in the same window.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
