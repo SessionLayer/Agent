@@ -1,0 +1,78 @@
+# SessionLayer Agent — hardened systemd unit (NFR-5).
+#
+# The bare-metal / VM deployment model for a node that dials OUT: the Agent binds
+# no listener at all, so unlike the Gateway there is no privileged port and no
+# privilege-drop-after-bind. It must never run as root — a root Agent could read
+# the node's host key and impersonate the node — so it runs unprivileged from the
+# first instruction. The directives below are the OS-level layer that composes
+# with the binary's own seccomp + Landlock (--seccomp / --landlock).
+#
+# For a container deployment use deploy/kubernetes/ instead.
+#
+# The Agent takes its configuration as command-line flags, so the environment
+# file below carries them as one variable rather than a key per setting:
+#
+#   SESSIONLAYER_AGENT_ARGS=--node-name=node-1 --join-method=token \
+#     --join-token-file=/etc/sessionlayer/join-token \
+#     --gateway-endpoint=wss://gw-a.example:8443 ...
+
+[Unit]
+Description=SessionLayer Agent (outbound node agent)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/sessionlayer/agent.env
+ExecStart=/usr/local/bin/sessionlayer-agent run $SESSIONLAYER_AGENT_ARGS
+
+# Exit 3 (generation mismatch — the Control Plane has auto-locked this identity)
+# and exit 4 (identity refused, repair needed) are terminal by contract. Looping
+# past either turns a security signal into restart noise and re-provisioning is a
+# human action, so the unit stops and stays failed for the alert to find.
+Restart=on-failure
+RestartSec=2s
+RestartPreventExitStatus=3 4
+
+# A SIGTERM lands mid-drain and possibly mid-renewal; the persist has to finish
+# or the next start presents a forked generation, which the Control Plane reads
+# as a clone. Covers the 30 s drain deadline and the renewal underneath it.
+TimeoutStopSec=60
+
+# The identity and its generation counter live here across restarts, and the
+# single-writer guard is a flock on it. StateDirectory gives it a stable path
+# with the right ownership per start, so DynamicUser costs nothing here.
+DynamicUser=yes
+StateDirectory=sessionlayer-agent
+StateDirectoryMode=0700
+
+# OS sandbox (belt-and-suspenders with the in-process Landlock/seccomp).
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+# Coarse OS-level syscall filter; the binary installs its own tighter allow-list.
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @swap @reboot @module @debug @cpu-emulation @obsolete
+SystemCallArchitectures=native
+# Coredumps are handled in-process (RLIMIT_CORE + PR_SET_DUMPABLE); belt here too.
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target
