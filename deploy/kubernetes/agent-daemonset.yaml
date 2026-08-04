@@ -39,7 +39,17 @@ spec:
       terminationGracePeriodSeconds: 60
       # Host-key access is root-only on the node; the Agent must never be root.
       hostPID: false
-      automountServiceAccountToken: true # OIDC join reads the projected SA token
+      # The Agent splices each dialled-back session to 127.0.0.1:22, and refuses
+      # any splice address that is not loopback. A pod's loopback is the pod's,
+      # not the node's, so without the host network namespace every session
+      # lands in a namespace with no sshd — the DaemonSet runs and serves
+      # nothing. This is why hostNetwork is here; it is not a convenience.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # The join reads its token from the projected volume declared below, which
+      # is independent of this field, and the Agent never calls the Kubernetes
+      # API. An automounted token would be credential surface with no consumer.
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -59,8 +69,8 @@ spec:
             - --cp-server-name=controlplane
             - --bootstrap-ca-file=/etc/sessionlayer/ca.pem
             - --data-dir=/var/lib/sessionlayer-agent
-            - --gateway-endpoint=wss://gw-a.sessionlayer:8443
-            - --gateway-endpoint=wss://gw-b.sessionlayer:8443
+            - --gateway-endpoint=wss://gw-a.sessionlayer:9444
+            - --gateway-endpoint=wss://gw-b.sessionlayer:9444
             - --gateway-failure-domain=az-a
             - --gateway-failure-domain=az-b
             - --min-control-channels=2
