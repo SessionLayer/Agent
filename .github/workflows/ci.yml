@@ -244,6 +244,17 @@ jobs:
               || { echo "::error::the rendered argument list is missing $flag"; exit 1; }
           done
 
+          # image.digest must win over image.tag, or pinning by digest is
+          # decoration. Both are set here, and only one may survive.
+          ref=$(helm template chart-ci "$CHART" -f "$CHART"/ci/production-values.yaml \
+                  --set image.tag=v9.9.9 --set image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+                | grep -m1 -oE 'image: ghcr\.io/sessionlayer/agent[@:][^ ]+')
+          echo "$ref"
+          case "$ref" in
+            *"@sha256:0000000000000000000000000000000000000000000000000000000000000000") ;;
+            *) echo "::error::image.digest did not win over image.tag: $ref"; exit 1 ;;
+          esac
+
       # The half with teeth. Everything above would still pass if every
       # `required` in the chart were deleted.
       - name: Assert the chart refuses an install it must refuse
@@ -269,6 +280,27 @@ jobs:
             esac
           }
 
+          renders() { # renders <why> <command...>
+            local why="$1"; shift
+            local out rc
+            set +e
+            out=$("$@" 2>&1); rc=$?
+            set -e
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::$why should render, but was refused. A guard that says no to everything passes every refusal assertion above:"
+              printf '%s\n' "$out"
+              exit 1
+            fi
+            printf 'renders as required: %s\n' "$why"
+          }
+
+          # An install with nothing configured must not render at all. Which
+          # guard fires first depends on template ordering, so this asserts only
+          # that the refusal is one of this chart's own, named ones.
+          refuse "sessionlayer-agent:" \
+            helm template chart-ci "$CHART"
+
+
           # The pinned Control Plane CA. The Agent performs no trust-on-first-use.
           refuse "set trustAnchor.existingConfigMap" \
             helm template chart-ci "$CHART" -f "$prod" --set trustAnchor.existingConfigMap=null
@@ -293,8 +325,25 @@ jobs:
           refuse "below drainDeadlineSecs" \
             helm template chart-ci "$CHART" -f "$prod" --set terminationGracePeriodSeconds=10
 
-          # This chart's budget is maxUnavailable over a DaemonSet, so it has no
-          # minAvailable-against-replicaCount relationship to assert.
+          # The budget guard. This chart's is maxUnavailable over a DaemonSet, so
+          # zero is the broken value rather than a comparison against a replica
+          # count. The budget is off by default, so it is turned on to reach it.
+          on=(--set podDisruptionBudget.enabled=true)
+          refuse "allows no eviction at all" \
+            helm template chart-ci "$CHART" -f "$prod" "${on[@]}" --set podDisruptionBudget.maxUnavailable=0
+          refuse "allows no eviction at all" \
+            helm template chart-ci "$CHART" -f "$prod" "${on[@]}" --set 'podDisruptionBudget.maxUnavailable=0%'
+          refuse "neither a pod count nor a percentage" \
+            helm template chart-ci "$CHART" -f "$prod" "${on[@]}" --set 'podDisruptionBudget.maxUnavailable=abc'
+          refuse "cannot be negative" \
+            helm template chart-ci "$CHART" -f "$prod" "${on[@]}" --set podDisruptionBudget.maxUnavailable=-1
+
+          # The other direction. Without these, a guard that refused every value
+          # would satisfy every refusal assertion above it.
+          renders "a budget that allows one eviction" \
+            helm template chart-ci "$CHART" -f "$prod" "${on[@]}" --set podDisruptionBudget.maxUnavailable=1
+          renders "a percentage budget" \
+            helm template chart-ci "$CHART" -f "$prod" "${on[@]}" --set 'podDisruptionBudget.maxUnavailable=25%'
 
           # values.schema.json must reject a malformed values file rather than
           # rendering something surprising. The splice address is security-

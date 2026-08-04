@@ -1,4 +1,39 @@
 {{- if .Values.podDisruptionBudget.enabled }}
+{{- $max := .Values.podDisruptionBudget.maxUnavailable }}
+{{- $at := "sessionlayer-agent: podDisruptionBudget.maxUnavailable" }}
+{{- /*
+The same hazard the other charts guard against, reached by the other key: a
+budget that allows nothing refuses every voluntary eviction, so a node drain
+never finishes. maxUnavailable IS the number of evictions allowed, so zero is
+the broken value and there is no replica count to compare against.
+
+The percentage form cannot be decided here. Kubernetes rounds a maxUnavailable
+percentage DOWN against the pod count, and for a DaemonSet that count is the
+number of nodes, which a chart cannot know: 10% is one pod on a ten-node
+cluster and zero on a three-node one. Only 0% is wrong at every size.
+*/}}
+{{- if kindIs "invalid" $max }}
+{{- fail (printf "%s is unset. Give a pod count or a percentage of the DaemonSet's pods." $at) }}
+{{- else if kindIs "string" $max }}
+{{- if not (regexMatch "^[0-9]+%$" $max) }}
+{{- fail (printf "%s is %q, which is neither a pod count nor a percentage. Kubernetes rejects it on apply, so it is refused here where the value is still in front of you." $at $max) }}
+{{- end }}
+{{- $pct := atoi (trimSuffix "%" $max) }}
+{{- if eq $pct 0 }}
+{{- fail (printf "%s is %q, which allows no eviction at all: every voluntary eviction is refused and a node drain never finishes." $at $max) }}
+{{- end }}
+{{- if gt $pct 100 }}
+{{- fail (printf "%s is %q, and a budget above 100%% of the pods is not a valid one." $at $max) }}
+{{- end }}
+{{- else }}
+{{- $count := int $max }}
+{{- if lt $count 0 }}
+{{- fail (printf "%s is %d, and a budget cannot be negative." $at $count) }}
+{{- end }}
+{{- if eq $count 0 }}
+{{- fail (printf "%s is 0, which allows no eviction at all: every voluntary eviction is refused and a node drain never finishes. Set it to at least 1, or turn the budget off." $at) }}
+{{- end }}
+{{- end }}
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
@@ -6,7 +41,7 @@ metadata:
   labels:
     {{- include "sessionlayer-agent.labels" . | nindent 4 }}
 spec:
-  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  maxUnavailable: {{ $max }}
   selector:
     matchLabels:
       {{- include "sessionlayer-agent.selectorLabels" . | nindent 6 }}
