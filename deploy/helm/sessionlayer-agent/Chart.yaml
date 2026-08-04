@@ -1,0 +1,17 @@
+apiVersion: v2
+name: sessionlayer-agent
+description: SessionLayer Agent, the per-node outbound connector that needs no inbound reachability.
+type: application
+# Versions the chart, not the component. appVersion tracks the Agent release
+# the default image tag resolves to.
+version: 0.1.0
+appVersion: "v0.0.2"
+# policy/v1 PodDisruptionBudget.
+kubeVersion: ">=1.21.0-0"
+home: https://github.com/SessionLayer/Agent
+sources:
+  - https://github.com/SessionLayer/Agent
+keywords:
+  - ssh
+  - agent
+  - zero-trust

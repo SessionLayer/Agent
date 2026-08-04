@@ -1,0 +1,138 @@
+{{- if not .Values.trustAnchor.existingConfigMap }}
+{{- fail "sessionlayer-agent: set trustAnchor.existingConfigMap to a ConfigMap holding the Control Plane's CA certificate. The Agent pins this anchor and performs no trust-on-first-use, so the join cannot proceed without it." }}
+{{- end }}
+{{- if and (ne .Values.join.method "oidc") (not .Values.join.existingSecret) }}
+{{- fail (printf "sessionlayer-agent: join.method=%s needs join.existingSecret set to a Secret holding the credential. This chart never creates one." .Values.join.method) }}
+{{- end }}
+{{- if lt (int .Values.terminationGracePeriodSeconds) (int .Values.drainDeadlineSecs) }}
+{{- fail (printf "sessionlayer-agent: terminationGracePeriodSeconds (%v) is below drainDeadlineSecs (%v). A SIGKILL landing in the credential-persist window leaves a generation the Control Plane reads as a clone and auto-locks, turning a routine node drain into a manual re-provision." .Values.terminationGracePeriodSeconds .Values.drainDeadlineSecs) }}
+{{- end }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "sessionlayer-agent.fullname" . }}
+  labels:
+    {{- include "sessionlayer-agent.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "sessionlayer-agent.selectorLabels" . | nindent 6 }}
+  {{- with .Values.updateStrategy }}
+  updateStrategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "sessionlayer-agent.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "sessionlayer-agent.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      hostNetwork: {{ .Values.hostNetwork }}
+      {{- if .Values.dnsPolicy }}
+      dnsPolicy: {{ .Values.dnsPolicy }}
+      {{- else if .Values.hostNetwork }}
+      # Without this a host-network pod resolves through the node's resolver and
+      # never sees the cluster's Service names.
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
+      # The Agent must never be root, and it needs no view of other processes.
+      hostPID: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: agent
+          image: {{ include "sessionlayer-agent.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            {{- include "sessionlayer-agent.args" . | nindent 12 }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            # The only writable path, matching the in-process Landlock rule.
+            - name: data
+              mountPath: {{ .Values.dataDir }}
+            - name: bootstrap-ca
+              mountPath: /etc/sessionlayer
+              readOnly: true
+            - name: join
+              mountPath: {{ include "sessionlayer-agent.joinMountPath" . }}
+              readOnly: true
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: bootstrap-ca
+          configMap:
+            name: {{ .Values.trustAnchor.existingConfigMap }}
+            items:
+              - key: {{ .Values.trustAnchor.key }}
+                path: {{ .Values.trustAnchor.key }}
+        - name: join
+          {{- if eq .Values.join.method "oidc" }}
+          projected:
+            defaultMode: 0440
+            sources:
+              # Audience-scoped and short-lived: the kubelet rotates it, and the
+              # Control Plane refuses one minted for anything else.
+              - serviceAccountToken:
+                  path: token
+                  audience: {{ .Values.join.audience }}
+                  expirationSeconds: {{ .Values.join.expirationSeconds }}
+          {{- else }}
+          secret:
+            secretName: {{ .Values.join.existingSecret }}
+            defaultMode: 0440
+            items:
+              {{- if eq .Values.join.method "mtls" }}
+              - key: {{ .Values.join.certKey }}
+                path: {{ .Values.join.certKey }}
+              - key: {{ .Values.join.keyKey }}
+                path: {{ .Values.join.keyKey }}
+              {{- else }}
+              - key: {{ .Values.join.tokenKey }}
+                path: token
+              {{- end }}
+          {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

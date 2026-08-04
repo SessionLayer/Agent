@@ -1,0 +1,38 @@
+{{ .Chart.Name }} {{ .Chart.Version }} installed as release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+
+Image:         {{ include "sessionlayer-agent.image" . }}
+{{- if not .Values.image.digest }}
+               Pinned by tag. Set image.digest to pin the exact bytes.
+{{- end }}
+Control Plane: {{ include "sessionlayer-agent.cpEndpoint" . }} (certificate name {{ include "sessionlayer-agent.cpServerName" . }})
+Join method:   {{ .Values.join.method }}
+Gateways:      {{ range .Values.gateways }}{{ .endpoint }} ({{ .serverName }}) {{ end }}
+
+Each Agent registers its node under the Kubernetes node name. Watch them join:
+
+  kubectl -n {{ .Release.Namespace }} rollout status ds/{{ include "sessionlayer-agent.fullname" . }}
+  kubectl -n {{ .Release.Namespace }} logs ds/{{ include "sessionlayer-agent.fullname" . }} | grep -i join
+{{ if not .Values.hostNetwork }}
+hostNetwork is off, so {{ .Values.spliceAddr }} is the pod's loopback and not the
+node's. Sessions to this node will not reach its sshd. Turn hostNetwork on for
+the DaemonSet's stated job, or run this Agent beside an sshd in the same pod.
+{{ end }}
+{{- if eq .Values.join.method "oidc" }}
+The join token is a projected ServiceAccount token for audience
+{{ .Values.join.audience }}. The Control Plane accepts it only when
+sessionlayer.agent-join.oidc.enabled is true and its configured audience
+matches.
+{{- end }}
+{{- if .Values.networkPolicy.enabled }}
+{{- if not .Values.networkPolicy.gatewayCidrs }}
+
+NetworkPolicy is on and networkPolicy.gatewayCidrs is empty, so only Gateways
+running as pods in this cluster are reachable. Add the ranges of any Gateway
+outside it.
+{{- end }}
+{{- else }}
+
+NetworkPolicy is disabled. The in-process Landlock ruleset filters TCP connect
+by port only and has no UDP support, so this policy is the only layer that
+scopes which hosts a compromised Agent can reach.
+{{- end }}
