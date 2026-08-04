@@ -161,3 +161,151 @@ jobs:
           got_revision=$(printf '%s' "$labels" | jq -r '."org.opencontainers.image.revision"')
           [ "$got_version" = "$EXPECT_VERSION" ] || { echo "::error::version label is '$got_version', expected '$EXPECT_VERSION'"; exit 1; }
           [ "$got_revision" = "$EXPECT_REVISION" ] || { echo "::error::revision label is '$got_revision', expected '$EXPECT_REVISION'"; exit 1; }
+
+  # Not the required check — `gate` is. Without this the chart's only validation
+  # is whatever someone ran by hand, and the first values change that breaks a
+  # render lands green.
+  chart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      CHART: deploy/helm/sessionlayer-agent
+      # Floating tool versions are the hazard a floating image tag is. Both
+      # downloads are checksum-verified below.
+      HELM_VERSION: 3.19.0
+      HELM_SHA256: a7f81ce08007091b86d8bd696eb4d86b8d0f2e1b9f6c714be62f82f96a594496
+      KUBECONFORM_VERSION: 0.7.0
+      KUBECONFORM_SHA256: c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3
+      # Schemas are fetched per run, so the Kubernetes version is pinned too;
+      # otherwise the meaning of a green check moves under the chart.
+      KUBE_VERSION: 1.31.0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install helm and kubeconform
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          cd "$RUNNER_TEMP"
+
+          curl -fsSLO "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm-v${HELM_VERSION}-linux-amd64.tar.gz" | sha256sum -c -
+          tar -xzf "helm-v${HELM_VERSION}-linux-amd64.tar.gz" linux-amd64/helm
+          mv linux-amd64/helm "$RUNNER_TEMP/bin/helm"
+
+          curl -fsSLO "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "${KUBECONFORM_SHA256}  kubeconform-linux-amd64.tar.gz" | sha256sum -c -
+          tar -xzf kubeconform-linux-amd64.tar.gz -C "$RUNNER_TEMP/bin" kubeconform
+
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Lint, render and schema-check
+        run: |
+          set -euo pipefail
+          helm lint "$CHART"
+
+          for values in "$CHART"/ci/*.yaml; do
+            name=$(basename "$values" .yaml)
+            echo "::group::$name"
+            helm lint "$CHART" -f "$values"
+
+            out="$RUNNER_TEMP/$name.rendered.yaml"
+            helm template chart-ci "$CHART" -f "$values" > "$out"
+            [ -s "$out" ] || { echo "::error::$name rendered nothing"; exit 1; }
+
+            # A bare exit code cannot tell a clean run from an empty one:
+            # kubeconform exits 0 over zero resources, and a resource whose
+            # schema it never found is 'skipped', not failed.
+            report=$(kubeconform -strict -summary -output json \
+              -schema-location default -kubernetes-version "$KUBE_VERSION" "$out")
+            echo "$report" | jq -c '.summary'
+            echo "$report" | jq -e \
+              '.summary.valid > 0 and .summary.invalid == 0
+               and .summary.errors == 0 and .summary.skipped == 0' >/dev/null
+
+            # A template that silently stops rendering still schema-validates.
+            workloads=$(grep -c '^kind: DaemonSet$' "$out" || true)
+            [ "$workloads" = 1 ] || { echo "::error::$name rendered $workloads DaemonSets, expected 1"; exit 1; }
+            grep -qE '^          image: ghcr\.io/sessionlayer/agent[@:]' "$out" \
+              || { echo "::error::$name rendered no agent image reference"; exit 1; }
+            echo "::endgroup::"
+          done
+
+          # The argument list is the whole configuration, so a flag that stops
+          # being emitted is a silent behaviour change.
+          out="$RUNNER_TEMP/production-values.rendered.yaml"
+          for flag in --node-name --join-method --bootstrap-ca-file --data-dir \
+                      --gateway-endpoint --gateway-server-name --splice-addr \
+                      --min-control-channels --drain-deadline-secs; do
+            grep -q -- "- $flag=" "$out" \
+              || { echo "::error::the rendered argument list is missing $flag"; exit 1; }
+          done
+
+      # The half with teeth. Everything above would still pass if every
+      # `required` in the chart were deleted.
+      - name: Assert the chart refuses an install it must refuse
+        run: |
+          set -euo pipefail
+          prod="$CHART/ci/production-values.yaml"
+
+          refuse() { # refuse <expected-substring> <command...>
+            local want="$1"; shift
+            local out rc
+            set +e
+            out=$("$@" 2>&1); rc=$?
+            set -e
+            if [ "$rc" -eq 0 ]; then
+              echo "::error::expected a refusal naming '$want', but this succeeded: $*"
+              exit 1
+            fi
+            case "$out" in
+              *"$want"*) printf 'refused on %s\n' "$want" ;;
+              *) echo "::error::refused, but not on '$want'. Actual output:"
+                 printf '%s\n' "$out"
+                 exit 1 ;;
+            esac
+          }
+
+          # The pinned Control Plane CA. The Agent performs no trust-on-first-use.
+          refuse "set trustAnchor.existingConfigMap" \
+            helm template chart-ci "$CHART" -f "$prod" --set trustAnchor.existingConfigMap=null
+          # A join method that needs a credential, with no Secret named.
+          refuse "join.existingSecret" \
+            helm template chart-ci "$CHART" -f "$prod" --set join.method=token
+          # A gateway entry whose serverName is unset falls back to a development
+          # name and fails the TLS handshake with nothing that names the cause.
+          # Two layers, and the template guard is the one that survives a schema
+          # deletion, so reach it with the key genuinely absent rather than null.
+          refuse "/gateways/0/serverName" \
+            helm template chart-ci "$CHART" -f "$prod" --set gateways[0].serverName=null
+          printf 'minControlChannels: 1\ngateways:\n  - endpoint: wss://gw-a.example.com:9444\n' > "$RUNNER_TEMP/no-servername.yaml"
+          refuse "give each gateway entry a serverName" \
+            helm template chart-ci "$CHART" -f "$prod" -f "$RUNNER_TEMP/no-servername.yaml"
+          # An Agent with no Gateway holds an identity and serves nothing, which
+          # looks healthy. --set cannot express an empty list.
+          printf 'gateways: []\nminControlChannels: 1\n' > "$RUNNER_TEMP/no-gateways.yaml"
+          refuse "set gateways to at least one entry" \
+            helm template chart-ci "$CHART" -f "$prod" -f "$RUNNER_TEMP/no-gateways.yaml"
+          # A SIGKILL in the credential-persist window reads as a clone upstream.
+          refuse "below drainDeadlineSecs" \
+            helm template chart-ci "$CHART" -f "$prod" --set terminationGracePeriodSeconds=10
+
+          # This chart's budget is maxUnavailable over a DaemonSet, so it has no
+          # minAvailable-against-replicaCount relationship to assert.
+
+          # values.schema.json must reject a malformed values file rather than
+          # rendering something surprising. The splice address is security-
+          # relevant: the binary refuses anything that is not loopback.
+          refuse "/spliceAddr" \
+            helm lint "$CHART" -f "$prod" --set spliceAddr=10.0.0.5:22
+          refuse "/image/digest" \
+            helm lint "$CHART" -f "$prod" --set image.digest=sha256:abc
+
+      - name: helm package
+        run: |
+          set -euo pipefail
+          helm package "$CHART" -d "$RUNNER_TEMP/packaged"
+          ls -l "$RUNNER_TEMP/packaged"
