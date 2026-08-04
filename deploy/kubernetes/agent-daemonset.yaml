@@ -49,7 +49,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: agent
-          image: ghcr.io/sessionlayer/agent:latest # pin by digest in production
+          image: ghcr.io/sessionlayer/agent:v0.0.2 # pin by digest in production
           args:
             - run
             - --node-name=$(NODE_NAME)
