@@ -43,6 +43,16 @@ wire-protocol:  1.0 - 1.0  (N-1 window; contracts/wire/agent-gateway-v1.md)
 grpc-contract:  sessionlayer.controlplane.v1  (vendored common.proto + agent.proto)
 ```
 
+Log output carries ANSI colour escapes whether or not stderr is a terminal, and
+`docker compose logs --no-color` strips only Compose's own service prefix. An
+escape sits between every field name and its `=`, so a grep for `node_name=` over
+a raw `docker logs` matches nothing and reads as if the event never happened.
+Strip the escapes first:
+
+```bash
+docker logs sessionlayer-agent 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep 'node_name='
+```
+
 The release workflow publishes both platforms on a `v*` tag, signs the index and
 every platform manifest with keyless cosign, and attaches an SPDX SBOM and SLSA
 provenance. Verify an image before you run it, substituting the tag you intend to
