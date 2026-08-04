@@ -13,7 +13,7 @@
 # multi-crate workspace on a shared 2-core builder.
 [package]
 name = "sessionlayer-agent"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 rust-version = "1.95"
 description = "SessionLayer Agent — per-node outbound connector for the Zero-Trust SSH platform."

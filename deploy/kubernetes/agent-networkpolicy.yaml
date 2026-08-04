@@ -59,7 +59,7 @@ spec:
               app.kubernetes.io/name: sessionlayer-gateway
       ports:
         - protocol: TCP
-          port: 8443
+          port: 9444
     # OTLP collector — uncomment only if OTEL_EXPORTER_OTLP_ENDPOINT is set.
     # - to:
     #     - namespaceSelector:

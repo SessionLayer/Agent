@@ -1,0 +1,176 @@
+# Default values for sessionlayer-agent.
+#
+# The Agent takes its configuration as command-line flags, so this chart builds
+# an argument list rather than a config file. Nothing here is a credential: the
+# join credential is a Secret you name, or a token the kubelet projects.
+
+image:
+  repository: ghcr.io/sessionlayer/agent
+  # Empty resolves to the chart's appVersion.
+  tag: ""
+  # A tag is mutable and a digest is not. Set this in production; it wins over
+  # tag when both are present.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # The Agent never calls the Kubernetes API. A projected serviceAccountToken
+  # volume works without this, including the one the oidc join method reads, so
+  # turning it on would add an API credential nothing uses.
+  automountServiceAccountToken: false
+
+controlPlane:
+  # Empty derives controlplane.<namespace>.svc, which is the Service name the
+  # Control Plane chart creates.
+  endpoint: ""
+  # The name the Control Plane's certificate carries.
+  serverName: ""
+
+# The Control Plane's certificate authority, pinned. The Agent performs no
+# trust-on-first-use, so the join needs this anchor mounted. Create the
+# ConfigMap from your CA PEM and name it here.
+trustAnchor:
+  existingConfigMap: ""
+  key: "ca.pem"
+
+join:
+  # token: a single-use join token from a Secret you create.
+  # oidc:  the kubelet projects a ServiceAccount token for the audience below.
+  # mtls:  an operator certificate and key from a Secret you create.
+  method: oidc
+  # oidc only. Must match sessionlayer.agent-join.oidc.audience on the Control
+  # Plane, which validates it.
+  audience: "sessionlayer-controlplane"
+  expirationSeconds: 3600
+  # token and mtls only.
+  existingSecret: ""
+  tokenKey: "token"
+  certKey: "tls.crt"
+  keyKey: "tls.key"
+
+# The Gateways this node's sessions arrive over. serverName is the name the
+# Gateway enrolled under, which its certificate carries; the binary's fallback
+# is a development name, so it is demanded here instead. failureDomain is
+# optional and derived from the endpoint host when every entry omits it.
+#
+#   gateways:
+#     - endpoint: wss://gw-a.example.com:9444
+#       serverName: gw-a
+#       failureDomain: az-a
+gateways: []
+
+# The Agent tolerates a Gateway being unreachable only while this many control
+# channels remain up. Raising it above 1 is what makes a single Gateway outage
+# a non-event, and it cannot exceed the number of endpoints above.
+minControlChannels: 1
+
+# Where each dialed-back session is spliced. The Agent refuses anything that is
+# not a loopback address, so the node's own sshd is reachable only when the pod
+# shares the node's network namespace. See hostNetwork below.
+spliceAddr: "127.0.0.1:22"
+maxConcurrentSplices: 32
+drainDeadlineSecs: 30
+
+dataDir: "/var/lib/sessionlayer-agent"
+
+# On means the process refuses to start where the kernel cannot fully enforce
+# Landlock, instead of degrading to the container's read-only root filesystem
+# and dropped capabilities alone.
+requireFullLandlock: false
+
+# A pod's loopback is not the node's, so with this off the splice address above
+# reaches nothing and every session to this node fails to connect. Rendering
+# fails rather than shipping that, which is also what makes sharing the node's
+# network namespace a decision you make rather than one the chart makes for
+# you: it is left off here so that turning it on is deliberate, and so that
+# upgrading this chart never widens an existing install's namespace on its own.
+hostNetwork: false
+dnsPolicy: ""
+
+extraArgs: []
+
+# Without requests the Agent lands in BestEffort and is the first thing the
+# kubelet evicts under node memory pressure, which is when it is most needed:
+# an evicted Agent makes its node unreachable through the platform. Requests
+# only, because the Agent's work is bounded by its channel count and a memory
+# limit would turn a burst into an OOMKill in the same window.
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+
+podSecurityContext:
+  # Host-key access on a node is root-only, and a root Agent could read the
+  # node's host key and impersonate it.
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+  capabilities:
+    drop: ["ALL"]
+
+# Kubernetes' 30s default is shorter than the Agent's own shutdown budget, and
+# the overrun is not a slow drain: a SIGKILL landing in the credential-persist
+# window leaves a generation the Control Plane reads as a clone and auto-locks,
+# so a routine node drain becomes a security page and a manual re-provision.
+# This covers the drain deadline and the in-flight renewal underneath it.
+terminationGracePeriodSeconds: 60
+
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 1
+
+# A node drain ignores DaemonSet pods, so this constrains only callers that go
+# through the eviction API, such as an autoscaler or a descheduler.
+podDisruptionBudget:
+  enabled: false
+  maxUnavailable: 1
+
+networkPolicy:
+  # The network layer enforces host and UDP scoping, which the in-process
+  # Landlock ruleset cannot: it filters TCP connect by port only, has no UDP
+  # support, and needs a recent kernel. The two are defence in depth.
+  enabled: true
+  controlPlanePodSelector:
+    app.kubernetes.io/name: sessionlayer-controlplane
+  # Must match the port inside controlPlane.endpoint.
+  controlPlaneGrpcPort: 9443
+  gatewayPodSelector:
+    app.kubernetes.io/name: sessionlayer-gateway
+  gatewayPort: 9444
+  dnsNamespaceSelector:
+    kubernetes.io/metadata.name: kube-system
+  dnsPodSelector:
+    k8s-app: kube-dns
+  # Gateways outside this cluster are reached at an address no pod selector can
+  # express. Empty until you name the ranges you use.
+  gatewayCidrs: []
+  extraEgress: []
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []

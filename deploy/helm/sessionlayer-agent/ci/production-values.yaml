@@ -1,0 +1,66 @@
+# A complete, realistic production configuration, used to lint and schema-check
+# the chart. The join credential is a projected ServiceAccount token, so
+# nothing here is a credential.
+image:
+  repository: ghcr.io/sessionlayer/agent
+  tag: "v0.0.2"
+  digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: ghcr-pull
+
+controlPlane:
+  endpoint: "https://controlplane.sessionlayer.svc:9443"
+  serverName: "controlplane.sessionlayer.svc"
+
+trustAnchor:
+  existingConfigMap: sessionlayer-bootstrap-ca
+  key: ca.pem
+
+join:
+  method: oidc
+  audience: sessionlayer-controlplane
+  expirationSeconds: 3600
+
+gateways:
+  - endpoint: wss://gw-a.example.com:9444
+    serverName: gw-a
+    failureDomain: az-a
+  - endpoint: wss://gw-b.example.com:9444
+    serverName: gw-b
+    failureDomain: az-b
+
+minControlChannels: 2
+spliceAddr: "127.0.0.1:22"
+maxConcurrentSplices: 32
+drainDeadlineSecs: 30
+
+requireFullLandlock: true
+
+# The DaemonSet fronts each node's own sshd, and a pod loopback is not the
+# node's.
+hostNetwork: true
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+networkPolicy:
+  enabled: true
+  gatewayCidrs:
+    - 10.10.0.0/16
+
+tolerations:
+  - operator: Exists
+
+priorityClassName: system-node-critical
+
+extraEnv:
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: https://otel-collector.observability:4317

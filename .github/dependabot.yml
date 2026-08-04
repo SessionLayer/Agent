@@ -16,9 +16,10 @@ updates:
     commit-message:
       prefix: deps
 
-  # Base images in the multi-stage Dockerfile (builder + distroless nonroot runtime).
+  # Base images in deploy/Dockerfile (builder + distroless nonroot runtime),
+  # which are pinned by digest and so never move on their own.
   - package-ecosystem: docker
-    directory: "/"
+    directory: "/deploy"
     schedule:
       interval: weekly
     labels:

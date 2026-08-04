@@ -6,8 +6,10 @@ fn component_info_advertises_agent_identity() {
     let info: ComponentInfo = version::component_info();
 
     assert_eq!(info.name, "SessionLayer Agent");
+    // Derived, not literal: a hard-coded version turns every release into a test
+    // edit, and what is worth asserting is that the reported version is the one
+    // this binary was built from.
     assert_eq!(info.semver, env!("CARGO_PKG_VERSION"));
-    assert_eq!(info.semver, "0.0.1");
 
     assert!(info.protocol_min.is_some(), "protocol_min must be set");
     assert!(info.protocol_max.is_some(), "protocol_max must be set");
@@ -62,7 +64,7 @@ fn version_info_serialises_to_stable_json() {
     let json = serde_json::to_value(version::version_info()).expect("serialise VersionInfo");
 
     assert_eq!(json["component"], "SessionLayer Agent");
-    assert_eq!(json["semver"], "0.0.1");
+    assert_eq!(json["semver"], env!("CARGO_PKG_VERSION"));
     assert_eq!(json["protocol_min"], "1.0");
     assert_eq!(json["protocol_max"], "1.0");
 }

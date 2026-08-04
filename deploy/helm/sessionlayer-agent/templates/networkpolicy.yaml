@@ -1,0 +1,65 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "sessionlayer-agent.fullname" . }}
+  labels:
+    {{- include "sessionlayer-agent.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "sessionlayer-agent.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  # Outbound only. A node running an Agent needs no inbound reachability.
+  ingress: []
+  egress:
+    {{- if .Values.networkPolicy.dnsPodSelector }}
+    - to:
+        - {{- if .Values.networkPolicy.dnsNamespaceSelector }}
+          namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.dnsNamespaceSelector | nindent 14 }}
+          {{- else }}
+          namespaceSelector: {}
+          {{- end }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.dnsPodSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- end }}
+    {{- with .Values.networkPolicy.controlPlanePodSelector }}
+    # The identity plane: join and renew, over mTLS gRPC.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ $.Values.networkPolicy.controlPlaneGrpcPort }}
+    {{- end }}
+    {{- if or .Values.networkPolicy.gatewayPodSelector .Values.networkPolicy.gatewayCidrs }}
+    # The node's Gateways: the outbound control channel and each dial-back.
+    - to:
+        {{- with .Values.networkPolicy.gatewayPodSelector }}
+        - podSelector:
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+        {{- end }}
+        {{- range .Values.networkPolicy.gatewayCidrs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.gatewayPort }}
+    {{- end }}
+    {{- with .Values.networkPolicy.extraEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}
