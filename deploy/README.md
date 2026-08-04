@@ -37,7 +37,7 @@ Build from the repository root, not from `deploy/`:
 ```console
 $ docker build -f deploy/Dockerfile -t sessionlayer/agent:dev .
 $ docker run --rm sessionlayer/agent:dev --version
-sessionlayer-agent 0.0.1
+sessionlayer-agent 0.0.2
 component:      SessionLayer Agent
 wire-protocol:  1.0 - 1.0  (N-1 window; contracts/wire/agent-gateway-v1.md)
 grpc-contract:  sessionlayer.controlplane.v1  (vendored common.proto + agent.proto)
