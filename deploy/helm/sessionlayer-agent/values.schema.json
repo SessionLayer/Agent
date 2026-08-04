@@ -81,8 +81,8 @@
     "minControlChannels": { "type": "integer", "minimum": 1 },
     "spliceAddr": {
       "type": "string",
-      "description": "A loopback IP and port. The Agent refuses anything else.",
-      "pattern": "^(127\\.[0-9.]+|\\[::1\\]):[0-9]{1,5}$"
+      "description": "A loopback IP and port: 127.0.0.0/8, or ::1 in brackets. The Agent parses this and refuses anything else, so the octets and the port are bounded here rather than merely shaped.",
+      "pattern": "^(127(\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}|\\[(::1|(0{1,4}:){7}0{0,3}1)\\]):(6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3})$"
     },
     "maxConcurrentSplices": { "type": "integer", "minimum": 1 },
     "drainDeadlineSecs": { "type": "integer", "minimum": 1 },

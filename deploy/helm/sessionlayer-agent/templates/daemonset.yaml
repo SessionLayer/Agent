@@ -4,6 +4,9 @@
 {{- if and (ne .Values.join.method "oidc") (not .Values.join.existingSecret) }}
 {{- fail (printf "sessionlayer-agent: join.method=%s needs join.existingSecret set to a Secret holding the credential. This chart never creates one." .Values.join.method) }}
 {{- end }}
+{{- if not .Values.hostNetwork }}
+{{- fail (printf "sessionlayer-agent: hostNetwork is off and spliceAddr is %s. The Agent splices every session to a loopback address and refuses to start on anything else, and a pod's loopback is not the node's, so the sshd this DaemonSet exists to front is unreachable: the pods run, the node registers, and every session to it fails to connect. This chart renders one container, so nothing else is listening on the pod's loopback either. Set hostNetwork: true, weighing that against sharing the node's network namespace." .Values.spliceAddr) }}
+{{- end }}
 {{- if lt (int .Values.terminationGracePeriodSeconds) (int .Values.drainDeadlineSecs) }}
 {{- fail (printf "sessionlayer-agent: terminationGracePeriodSeconds (%v) is below drainDeadlineSecs (%v). A SIGKILL landing in the credential-persist window leaves a generation the Control Plane reads as a clone and auto-locks, turning a routine node drain into a manual re-provision." .Values.terminationGracePeriodSeconds .Values.drainDeadlineSecs) }}
 {{- end }}

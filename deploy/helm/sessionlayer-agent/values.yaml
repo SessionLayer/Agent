@@ -86,10 +86,12 @@ dataDir: "/var/lib/sessionlayer-agent"
 # and dropped capabilities alone.
 requireFullLandlock: false
 
-# A pod loopback is not the node's loopback. With this off, the splice address
-# above reaches nothing, and sessions to this node fail to connect. Turn it on
-# for the DaemonSet's stated job of fronting the node's own sshd, and weigh
-# that against sharing the node's network namespace.
+# A pod's loopback is not the node's, so with this off the splice address above
+# reaches nothing and every session to this node fails to connect. Rendering
+# fails rather than shipping that, which is also what makes sharing the node's
+# network namespace a decision you make rather than one the chart makes for
+# you: it is left off here so that turning it on is deliberate, and so that
+# upgrading this chart never widens an existing install's namespace on its own.
 hostNetwork: false
 dnsPolicy: ""
 

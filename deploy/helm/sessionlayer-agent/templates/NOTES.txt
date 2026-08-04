@@ -12,12 +12,9 @@ Each Agent registers its node under the Kubernetes node name. Watch them join:
 
   kubectl -n {{ .Release.Namespace }} rollout status ds/{{ include "sessionlayer-agent.fullname" . }}
   kubectl -n {{ .Release.Namespace }} logs ds/{{ include "sessionlayer-agent.fullname" . }} | grep -i join
-{{ if not .Values.hostNetwork }}
-hostNetwork is off, so {{ .Values.spliceAddr }} is the pod's loopback and not the
-node's. Sessions to this node will not reach its sshd. Turn hostNetwork on for
-the DaemonSet's stated job, or run this Agent beside an sshd in the same pod.
-{{ end }}
-{{- if eq .Values.join.method "oidc" }}
+This pod shares the node's network namespace, which is what puts {{ .Values.spliceAddr }}
+in reach of the node's own sshd.
+{{ if eq .Values.join.method "oidc" }}
 The join token is a projected ServiceAccount token for audience
 {{ .Values.join.audience }}. The Control Plane accepts it only when
 sessionlayer.agent-join.oidc.enabled is true and its configured audience

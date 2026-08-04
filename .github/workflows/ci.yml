@@ -325,6 +325,15 @@ jobs:
           refuse "below drainDeadlineSecs" \
             helm template chart-ci "$CHART" -f "$prod" --set terminationGracePeriodSeconds=10
 
+          # The splice address is loopback-only in the binary, unconditionally,
+          # so a pod that does not share the node's network namespace splices
+          # into its own. Every values file in ci/ sets this true, which is
+          # exactly how the combination went unrendered until it was looked for.
+          refuse "hostNetwork is off" \
+            helm template chart-ci "$CHART" -f "$prod" --set hostNetwork=false
+          renders "the namespace the splice address needs" \
+            helm template chart-ci "$CHART" -f "$prod" --set hostNetwork=true
+
           # The budget guard. This chart's is maxUnavailable over a DaemonSet, so
           # zero is the broken value rather than a comparison against a replica
           # count. The budget is off by default, so it is turned on to reach it.
@@ -347,9 +356,21 @@ jobs:
 
           # values.schema.json must reject a malformed values file rather than
           # rendering something surprising. The splice address is security-
-          # relevant: the binary refuses anything that is not loopback.
-          refuse "/spliceAddr" \
-            helm lint "$CHART" -f "$prod" --set spliceAddr=10.0.0.5:22
+          # relevant: the binary refuses anything that is not loopback. The
+          # pattern is an address check rather than a shape check, so an
+          # impossible octet and an impossible port are refused here too, where
+          # the alternative is a container that exits at start.
+          for bad in 10.0.0.5:22 127.999.1.1:22 127.0.0.1:65536 127.0.0.1:0 localhost:22 127.0.0.1.5:22; do
+            refuse "/spliceAddr" \
+              helm lint "$CHART" -f "$prod" --set "spliceAddr=$bad"
+          done
+          # Both loopback families the binary accepts, including the expanded
+          # form of ::1. A pattern that refuses every address would satisfy
+          # every refusal above.
+          for good in 127.0.0.1:22 127.255.255.254:2222 '[::1]:22' '[0:0:0:0:0:0:0:1]:22'; do
+            renders "the splice address $good, which the binary parses and accepts" \
+              helm template chart-ci "$CHART" -f "$prod" --set "spliceAddr=$good"
+          done
           refuse "/image/digest" \
             helm lint "$CHART" -f "$prod" --set image.digest=sha256:abc
 

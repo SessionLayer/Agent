@@ -45,9 +45,13 @@ hostNetwork: true
 
 `dnsPolicy` then defaults to `ClusterFirstWithHostNet`, without which a
 host-network pod resolves through the node's resolver and never sees the
-cluster's Service names. Weigh this against sharing the node's network
-namespace. With `hostNetwork` off, the install notes say plainly that sessions
-to this node reach nothing.
+cluster's Service names.
+
+Rendering refuses `hostNetwork: false`, since the alternative is a DaemonSet
+whose pods run, whose nodes register, and whose every session fails to connect.
+The value stays off in `values.yaml` so that sharing the node's network
+namespace is something you turn on, and so that upgrading this chart never
+widens an existing install's namespace on its own.
 
 ## Join methods
 
@@ -71,6 +75,7 @@ would add an API credential nothing uses.
 | Condition | Why |
 |---|---|
 | No `trustAnchor.existingConfigMap` | The Agent pins the Control Plane's CA and performs no trust-on-first-use. |
+| `hostNetwork: false` | The splice address is loopback-only and a pod's loopback is not the node's, so the node's `sshd` is unreachable. This chart renders one container, so nothing else is listening on the pod's loopback either. |
 | `join.method` of `token` or `mtls` with no `join.existingSecret` | The chart never creates a credential. |
 | Empty `gateways` | An Agent with no Gateway endpoint joins, holds an identity and serves no session. It looks healthy and reaches nothing. |
 | A `gateways` entry without `serverName` | The binary's fallback is a development name, so an unset value fails the TLS handshake with nothing that names the cause. |
@@ -117,11 +122,11 @@ seconds covers the drain deadline and the in-flight renewal underneath it.
 |---|---|---|
 | `gateways` | `[]` | Each entry takes `endpoint`, `serverName` and optionally `failureDomain`. |
 | `minControlChannels` | `1` | The Agent tolerates a Gateway being unreachable only while this many channels remain up. Raising it above 1 is what makes a single Gateway outage a non-event. |
-| `spliceAddr` | `127.0.0.1:22` | Loopback only. |
+| `spliceAddr` | `127.0.0.1:22` | Loopback only: `127.0.0.0/8` or `::1` in brackets, with a port from 1 to 65535. Checked against those bounds at render time, since the binary parses the same string and refuses to start on anything else. |
 | `maxConcurrentSplices` | `32` | |
 | `drainDeadlineSecs` | `30` | |
 | `dataDir` | `/var/lib/sessionlayer-agent` | The only writable path, matching the in-process Landlock rule. |
-| `hostNetwork` | `false` | See above. |
+| `hostNetwork` | `false` | Rendering refuses this value. See above. |
 | `dnsPolicy` | `""` | Empty derives `ClusterFirstWithHostNet` when `hostNetwork` is on. |
 | `extraArgs` | `[]` | |
 
