@@ -53,14 +53,26 @@ Strip the escapes first:
 docker logs sessionlayer-agent 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep 'node_name='
 ```
 
+### Running the published image
+
 The release workflow publishes both platforms on a `v*` tag, signs the index and
 every platform manifest with keyless cosign, and attaches an SPDX SBOM and SLSA
-provenance. Verify an image before you run it, substituting the tag you intend to
-deploy:
+provenance. Verify before you pull, substituting the tag you intend to deploy:
 
 ```bash
 cosign verify \
-  --certificate-identity-regexp '^https://github.com/SessionLayer/Agent/\.github/workflows/release\.yml@refs/tags/' \
+  --certificate-identity-regexp '^https://github\.com/SessionLayer/Agent/\.github/workflows/release\.yml@refs/tags/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   ghcr.io/sessionlayer/agent:v0.0.2
+
+gh attestation verify oci://ghcr.io/sessionlayer/agent:v0.0.2 \
+  --repo SessionLayer/Agent \
+  --signer-workflow SessionLayer/Agent/.github/workflows/release.yml \
+  --source-ref refs/tags/v0.0.2
+
+docker pull ghcr.io/sessionlayer/agent:v0.0.2
 ```
+
+`--signer-workflow` and `--source-ref` are not optional. Without them
+`gh attestation verify` accepts an attestation from any workflow in the
+repository, which is a weaker claim than the one `cosign verify` above makes.
