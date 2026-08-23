@@ -51,7 +51,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=agent-registry-$TARGE
     install -D "target/$triple/release/sessionlayer-agent" /out/sessionlayer-agent; \
     install -d -o 65532 -g 65532 /out/rootfs/var/lib/sessionlayer-agent
 
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:adcd20c7b4c988b73cbfbddb26d2eee574571e6d7c9ffea29b3821e0690efb77 AS runtime
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS runtime
 
 ARG VERSION=0.0.0-dev
 ARG REVISION=unknown
