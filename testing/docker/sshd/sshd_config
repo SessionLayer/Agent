@@ -1,0 +1,24 @@
+# LogLevel VERBOSE so the cert key-id (session_id+identity) appears in the
+# node-local log.
+Port 22
+AddressFamily any
+
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_ecdsa_key
+HostKey /etc/ssh/ssh_host_rsa_key
+
+LogLevel VERBOSE
+
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+
+TrustedUserCAKeys /etc/ssh/trusted_user_ca.pub
+AuthorizedKeysFile .ssh/authorized_keys
+
+Subsystem sftp internal-sftp
+
+UsePAM no
+AllowUsers deploy dba
+AcceptEnv LANG LC_*

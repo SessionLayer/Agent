@@ -1,0 +1,56 @@
+# Requires a NetworkPolicy-enforcing CNI (Calico, Cilium, …). The loopback splice
+# to the node's own sshd (127.0.0.1:22) is in-pod traffic and is not subject to
+# NetworkPolicy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sessionlayer-agent-egress
+  namespace: sessionlayer
+  labels:
+    app.kubernetes.io/name: sessionlayer-agent
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: sessionlayer-agent
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: sessionlayer-controlplane
+      ports:
+        - protocol: TCP
+          port: 9443
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: sessionlayer-gateway
+      ports:
+        - protocol: TCP
+          port: 9444
+    # OTLP collector - uncomment only if OTEL_EXPORTER_OTLP_ENDPOINT is set.
+    # - to:
+    #     - namespaceSelector:
+    #         matchLabels:
+    #           kubernetes.io/metadata.name: observability
+    #       podSelector:
+    #         matchLabels:
+    #           app.kubernetes.io/name: otel-collector
+    #   ports:
+    #     - protocol: TCP
+    #       port: 4317

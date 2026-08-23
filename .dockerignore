@@ -1,0 +1,11 @@
+target/
+.git/
+.github/
+audit/
+scripts/
+dev/
+*.md
+!README.md
+.gitignore
+.dockerignore
+junit.xml

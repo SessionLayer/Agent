@@ -1,0 +1,48 @@
+{{ .Chart.Name }} {{ .Chart.Version }} installed as release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+
+Image:         {{ include "sessionlayer-agent.image" . }}
+{{- if not .Values.image.digest }}
+               Pinned by tag. Set image.digest to pin the exact bytes.
+{{- end }}
+Control Plane: {{ include "sessionlayer-agent.cpEndpoint" . }} (certificate name {{ include "sessionlayer-agent.cpServerName" . }})
+Join method:   {{ .Values.join.method }}
+Gateways:      {{ range .Values.gateways }}{{ .endpoint }} ({{ .serverName }}) {{ end }}
+
+Each Agent registers its node under the Kubernetes node name. Watch them join:
+
+  kubectl -n {{ .Release.Namespace }} rollout status ds/{{ include "sessionlayer-agent.fullname" . }}
+  kubectl -n {{ .Release.Namespace }} logs ds/{{ include "sessionlayer-agent.fullname" . }} | grep -i join
+This pod shares the node's network namespace, which is what puts {{ .Values.spliceAddr }}
+in reach of the node's own sshd.
+{{- if not .Values.persistence.enabled }}
+
+persistence is off, so the Agent's identity is an emptyDir and does not survive
+a pod restart. The next start re-joins, the Control Plane refuses a node whose
+identity is still active, and the pod exits 4 and stays down:
+
+  identity refused by the Control Plane - not transient, do not auto-restart
+  into a loop ... exit_code=4
+
+Recovering means deleting the node in the Control Plane and issuing a fresh
+join credential, by hand, per node. Set persistence.enabled=true for any
+cluster where a node reboot, an image bump or a rollout can happen.
+{{- end }}
+{{ if eq .Values.join.method "oidc" }}
+The join token is a projected ServiceAccount token for audience
+{{ .Values.join.audience }}. The Control Plane accepts it only when
+sessionlayer.agent-join.oidc.enabled is true and its configured audience
+matches.
+{{- end }}
+{{- if .Values.networkPolicy.enabled }}
+{{- if not .Values.networkPolicy.gatewayCidrs }}
+
+NetworkPolicy is on and networkPolicy.gatewayCidrs is empty, so only Gateways
+running as pods in this cluster are reachable. Add the ranges of any Gateway
+outside it.
+{{- end }}
+{{- else }}
+
+NetworkPolicy is disabled. The in-process Landlock ruleset filters TCP connect
+by port only and has no UDP support, so this policy is the only layer that
+scopes which hosts a compromised Agent can reach.
+{{- end }}

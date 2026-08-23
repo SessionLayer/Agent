@@ -1,0 +1,125 @@
+image:
+  repository: ghcr.io/sessionlayer/agent
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automountServiceAccountToken: false
+
+controlPlane:
+  endpoint: ""
+  serverName: ""
+
+trustAnchor:
+  existingConfigMap: ""
+  key: "ca.pem"
+
+join:
+  method: oidc
+  audience: "sessionlayer-controlplane"
+  expirationSeconds: 3600
+  existingSecret: ""
+  tokenKey: "token"
+  certKey: "tls.crt"
+  keyKey: "tls.key"
+
+gateways: []
+
+minControlChannels: 1
+
+spliceAddr: "127.0.0.1:22"
+maxConcurrentSplices: 32
+drainDeadlineSecs: 30
+
+dataDir: "/var/lib/sessionlayer-agent"
+
+# Where dataDir lives. It holds the Agent's mTLS identity, and losing it is not
+# a slow start next time: the Control Plane refuses to enrol a node whose
+# identity is still active, so the pod exits 4 and stays down until someone
+# deletes the node. Off, that happens on every pod restart - a node reboot, an
+# image bump, a rollout - which for a DaemonSet is routine.
+#
+# On, the identity is kept on the node, which is where the systemd deployment
+# keeps it too. Create the directory first, owned by the container's uid:
+# Kubernetes makes a hostPath root-owned 0755 and fsGroup does not apply to
+# one, so the Agent cannot write a directory Kubernetes created for it.
+#
+#   ansible/ssh: install -d -o 65532 -g 65532 -m 0700 /var/lib/sessionlayer-agent
+persistence:
+  enabled: false
+  hostPath: "/var/lib/sessionlayer-agent"
+  type: DirectoryOrCreate
+
+requireFullLandlock: false
+
+hostNetwork: false
+dnsPolicy: ""
+
+extraArgs: []
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+  capabilities:
+    drop: ["ALL"]
+
+terminationGracePeriodSeconds: 60
+
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 1
+
+podDisruptionBudget:
+  enabled: false
+  maxUnavailable: 1
+
+networkPolicy:
+  enabled: true
+  controlPlanePodSelector:
+    app.kubernetes.io/name: sessionlayer-controlplane
+  controlPlaneGrpcPort: 9443
+  gatewayPodSelector:
+    app.kubernetes.io/name: sessionlayer-gateway
+  gatewayPort: 9444
+  dnsNamespaceSelector:
+    kubernetes.io/metadata.name: kube-system
+  dnsPodSelector:
+    k8s-app: kube-dns
+  gatewayCidrs: []
+  extraEgress: []
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []

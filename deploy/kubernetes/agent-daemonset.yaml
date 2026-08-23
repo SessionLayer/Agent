@@ -1,0 +1,104 @@
+# The in-process Landlock egress is port-scoped (TCP only); the host/IP + UDP
+# enforcement is the shipped `agent-networkpolicy.yaml` (apply it alongside this
+# DaemonSet).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sessionlayer-agent
+  namespace: sessionlayer
+  labels:
+    app.kubernetes.io/name: sessionlayer-agent
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sessionlayer-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sessionlayer-agent
+    spec:
+      # Kubernetes' 30 s default is shorter than this Agent's own shutdown
+      # budget, and the overrun is not a slow drain - a SIGKILL landing in the
+      # credential-persist window leaves a generation the Control Plane reads as
+      # a clone and auto-locks, so a routine node drain becomes a security page
+      # and a manual re-provision. This covers the 30 s drain deadline and the
+      # in-flight renewal underneath it.
+      terminationGracePeriodSeconds: 60
+      hostPID: false
+      # The Agent splices each dialled-back session to 127.0.0.1:22, and refuses
+      # any splice address that is not loopback. A pod's loopback is the pod's,
+      # not the node's, so without the host network namespace every session
+      # lands in a namespace with no sshd - the DaemonSet runs and serves
+      # nothing. This is why hostNetwork is here; it is not a convenience.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent
+          image: ghcr.io/sessionlayer/agent:v0.0.2
+          args:
+            - run
+            - --node-name=$(NODE_NAME)
+            - --join-method=oidc
+            - --join-token-file=/var/run/secrets/sessionlayer/token
+            - --cp-endpoint=https://controlplane.sessionlayer.svc:9443
+            - --cp-server-name=controlplane
+            - --bootstrap-ca-file=/etc/sessionlayer/ca.pem
+            - --data-dir=/var/lib/sessionlayer-agent
+            - --gateway-endpoint=wss://gw-a.sessionlayer:9444
+            - --gateway-endpoint=wss://gw-b.sessionlayer:9444
+            - --gateway-failure-domain=az-a
+            - --gateway-failure-domain=az-b
+            - --min-control-channels=2
+            - --splice-addr=127.0.0.1:22
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          # Without requests the Agent lands in BestEffort and is the first thing
+          # the kubelet evicts under node memory pressure - which is when it is
+          # most needed, because an evicted Agent makes its node unreachable
+          # through the platform. Requests only: the Agent's work is bounded by
+          # its channel count, and a memory limit would turn a burst into an
+          # OOMKill in the same window.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/sessionlayer-agent
+            - name: bootstrap-ca
+              mountPath: /etc/sessionlayer
+              readOnly: true
+            - name: join-token
+              mountPath: /var/run/secrets/sessionlayer
+              readOnly: true
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: bootstrap-ca
+          configMap:
+            name: sessionlayer-bootstrap-ca
+        - name: join-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: sessionlayer-controlplane
+                  expirationSeconds: 3600

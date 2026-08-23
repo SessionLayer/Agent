@@ -1,0 +1,24 @@
+[profile.default]
+slow-timeout = { period = "30s", terminate-after = 2 }
+failure-output = "immediate-final"
+# Run the whole suite rather than stopping at the first failure: a red gate should
+# report every broken test, not just the earliest one.
+fail-fast = false
+
+[test-groups]
+# The Docker E2E tests each stand up containers on `--network host`; running
+# several at once on a small CI box starves them (image builds + SSH handshakes)
+# into false timeouts. Serialise them.
+docker-e2e = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(splice_e2e) | binary(docker_e2e)'
+test-group = 'docker-e2e'
+slow-timeout = { period = "180s", terminate-after = 2 }
+
+[profile.ci]
+retries = 1
+failure-output = "immediate-final"
+
+[profile.ci.junit]
+path = "junit.xml"

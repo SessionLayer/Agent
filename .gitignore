@@ -1,0 +1,15 @@
+debug
+target
+
+junit.xml
+
+**/*.rs.bk
+
+*.pdb
+
+**/mutants.out*/
+
+*.cdx.json
+*.sigstore.json
+SHA256SUMS
+!src/supply_chain/testdata/golden/*.sigstore.json

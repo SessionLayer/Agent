@@ -1,0 +1,380 @@
+# ONE required job, id `gate`, so the branch-protection required check is
+# literally `gate`.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Real drift gate: clones SessionLayer/Contracts at the tag pinned in
+      # contracts.lock, verifies the resolved SHA, and diffs the vendored
+      # copies -- a sibling-checkout-path sync would no-op here, since CI
+      # checks out one repo at a time and a sibling path never exists.
+      - name: Verify vendored contracts (contracts.lock)
+        run: ./scripts/vendor-contracts.sh --check
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          protoc --version
+
+      - name: Install Rust toolchain (pinned by rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned commit (action publishes no semver tags)
+        with:
+          toolchain: "1.97.1"
+          components: rustfmt, clippy
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install cargo-nextest, cargo-deny, cargo-audit (pinned)
+        uses: taiki-e/install-action@a2a5f6e99e1a31540baa0468acfa302cff0f359f # v2.86.4
+        with:
+          tool: cargo-nextest@0.9.135,cargo-deny@0.19.6,cargo-audit@0.22.1
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo nextest
+        run: cargo nextest run --all-features
+
+      - name: cargo audit
+        run: cargo audit -D warnings
+
+      - name: cargo deny
+        run: cargo deny check
+
+      # Build-level proof the arm64 target compiles - the Tier-0 seccomp allow-list
+      # is arch-parameterized, so aarch64 needs its own compile check. `ring`'s
+      # C needs the cross linker/compiler; std comes from the toolchain `targets`.
+      - name: Install aarch64 cross linker + target libc headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+      - name: aarch64 cross-check (cargo check --target aarch64-unknown-linux-gnu)
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+        run: cargo check --target aarch64-unknown-linux-gnu --locked
+
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      IMG: sessionlayer/agent:ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Build linux/amd64
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: ${{ env.IMG }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            REVISION=${{ github.sha }}
+
+      - name: Build linux/arm64
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/arm64
+          push: false
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            REVISION=${{ github.sha }}
+
+      - name: Assert the runtime posture
+        env:
+          EXPECT_VERSION: ${{ github.ref_name }}
+          EXPECT_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          user=$(docker image inspect -f '{{.Config.User}}' "$IMG")
+          echo "USER: ${user:-<empty>}"
+          case "$user" in
+            ""|root|0|root:*|0:*) echo "::error::image runs as ${user:-<empty>}; runAsNonRoot cannot enforce this"; exit 1 ;;
+          esac
+
+          # The positive control: the entrypoint itself must run. Without it, a
+          # container runtime broken for any unrelated reason would make the
+          # no-shell assertion below pass for the wrong reason.
+          docker run --rm "$IMG" --version
+
+          if docker run --rm --entrypoint /bin/sh "$IMG" -c true 2>/dev/null; then
+            echo "::error::/bin/sh exists in the final layer"; exit 1
+          fi
+          echo "no shell in the final layer"
+
+          labels=$(docker image inspect -f '{{json .Config.Labels}}' "$IMG")
+          for key in title description source licenses version revision; do
+            value=$(printf '%s' "$labels" | jq -r --arg k "org.opencontainers.image.$key" '.[$k] // ""')
+            echo "org.opencontainers.image.$key = ${value:-<empty>}"
+            [ -n "$value" ] || { echo "::error::label org.opencontainers.image.$key is unset"; exit 1; }
+          done
+
+          got_version=$(printf '%s' "$labels" | jq -r '."org.opencontainers.image.version"')
+          got_revision=$(printf '%s' "$labels" | jq -r '."org.opencontainers.image.revision"')
+          [ "$got_version" = "$EXPECT_VERSION" ] || { echo "::error::version label is '$got_version', expected '$EXPECT_VERSION'"; exit 1; }
+          [ "$got_revision" = "$EXPECT_REVISION" ] || { echo "::error::revision label is '$got_revision', expected '$EXPECT_REVISION'"; exit 1; }
+
+  chart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      CHART: deploy/helm/sessionlayer-agent
+      HELM_VERSION: 3.19.0
+      HELM_SHA256: a7f81ce08007091b86d8bd696eb4d86b8d0f2e1b9f6c714be62f82f96a594496
+      KUBECONFORM_VERSION: 0.7.0
+      KUBECONFORM_SHA256: c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3
+      KUBE_VERSION: 1.31.0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install helm and kubeconform
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          cd "$RUNNER_TEMP"
+
+          curl -fsSLO "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm-v${HELM_VERSION}-linux-amd64.tar.gz" | sha256sum -c -
+          tar -xzf "helm-v${HELM_VERSION}-linux-amd64.tar.gz" linux-amd64/helm
+          mv linux-amd64/helm "$RUNNER_TEMP/bin/helm"
+
+          curl -fsSLO "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "${KUBECONFORM_SHA256}  kubeconform-linux-amd64.tar.gz" | sha256sum -c -
+          tar -xzf kubeconform-linux-amd64.tar.gz -C "$RUNNER_TEMP/bin" kubeconform
+
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Lint, render and schema-check
+        run: |
+          set -euo pipefail
+          helm lint "$CHART"
+
+          for values in "$CHART"/ci/*.yaml; do
+            name=$(basename "$values" .yaml)
+            echo "::group::$name"
+            helm lint "$CHART" -f "$values"
+
+            out="$RUNNER_TEMP/$name.rendered.yaml"
+            helm template chart-ci "$CHART" -f "$values" > "$out"
+            [ -s "$out" ] || { echo "::error::$name rendered nothing"; exit 1; }
+
+            # A bare exit code cannot tell a clean run from an empty one:
+            # kubeconform exits 0 over zero resources, and a resource whose
+            # schema it never found is 'skipped', not failed.
+            report=$(kubeconform -strict -summary -output json \
+              -schema-location default -kubernetes-version "$KUBE_VERSION" "$out")
+            echo "$report" | jq -c '.summary'
+            echo "$report" | jq -e \
+              '.summary.valid > 0 and .summary.invalid == 0
+               and .summary.errors == 0 and .summary.skipped == 0' >/dev/null
+
+            # A template that silently stops rendering still schema-validates.
+            workloads=$(grep -c '^kind: DaemonSet$' "$out" || true)
+            [ "$workloads" = 1 ] || { echo "::error::$name rendered $workloads DaemonSets, expected 1"; exit 1; }
+            grep -qE '^          image: ghcr\.io/sessionlayer/agent[@:]' "$out" \
+              || { echo "::error::$name rendered no agent image reference"; exit 1; }
+            echo "::endgroup::"
+          done
+
+          out="$RUNNER_TEMP/production-values.rendered.yaml"
+          for flag in --node-name --join-method --bootstrap-ca-file --data-dir \
+                      --gateway-endpoint --gateway-server-name --splice-addr \
+                      --min-control-channels --drain-deadline-secs; do
+            grep -q -- "- $flag=" "$out" \
+              || { echo "::error::the rendered argument list is missing $flag"; exit 1; }
+          done
+
+          ref=$(helm template chart-ci "$CHART" -f "$CHART"/ci/production-values.yaml \
+                  --set image.tag=v9.9.9 --set image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+                | grep -m1 -oE 'image: ghcr\.io/sessionlayer/agent[@:][^ ]+')
+          echo "$ref"
+          case "$ref" in
+            *"@sha256:0000000000000000000000000000000000000000000000000000000000000000") ;;
+            *) echo "::error::image.digest did not win over image.tag: $ref"; exit 1 ;;
+          esac
+
+      # The half with teeth. Everything above would still pass if every
+      # `required` in the chart were deleted.
+      - name: Assert the chart refuses an install it must refuse
+        run: |
+          set -euo pipefail
+          prod="$CHART/ci/production-values.yaml"
+
+          refuse() {
+            local want="$1"; shift
+            local out rc
+            set +e
+            out=$("$@" 2>&1); rc=$?
+            set -e
+            if [ "$rc" -eq 0 ]; then
+              echo "::error::expected a refusal naming '$want', but this succeeded: $*"
+              exit 1
+            fi
+            case "$out" in
+              *"$want"*) printf 'refused on %s\n' "$want" ;;
+              *) echo "::error::refused, but not on '$want'. Actual output:"
+                 printf '%s\n' "$out"
+                 exit 1 ;;
+            esac
+          }
+
+          renders() {
+            local why="$1"; shift
+            local out rc
+            set +e
+            out=$("$@" 2>&1); rc=$?
+            set -e
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::$why should render, but was refused. A guard that says no to everything passes every refusal assertion above:"
+              printf '%s\n' "$out"
+              exit 1
+            fi
+            printf 'renders as required: %s\n' "$why"
+          }
+
+          # An install with nothing configured must not render at all. Which
+          # guard fires first depends on template ordering, so this asserts only
+          # that the refusal is one of this chart's own, named ones.
+          refuse "sessionlayer-agent:" \
+            helm template chart-ci "$CHART"
+
+          refuse "set trustAnchor.existingConfigMap" \
+            helm template chart-ci "$CHART" -f "$prod" --set trustAnchor.existingConfigMap=null
+          refuse "join.existingSecret" \
+            helm template chart-ci "$CHART" -f "$prod" --set join.method=token
+          # The schema and the template both guard this. The template guard is the
+          # one that survives a schema deletion, so reach it with the key genuinely
+          # absent rather than null.
+          refuse "/gateways/0/serverName" \
+            helm template chart-ci "$CHART" -f "$prod" --set gateways[0].serverName=null
+          printf 'minControlChannels: 1\ngateways:\n  - endpoint: wss://gw-a.example.com:9444\n' > "$RUNNER_TEMP/no-servername.yaml"
+          refuse "give each gateway entry a serverName" \
+            helm template chart-ci "$CHART" -f "$prod" -f "$RUNNER_TEMP/no-servername.yaml"
+          # --set cannot express an empty list.
+          printf 'gateways: []\nminControlChannels: 1\n' > "$RUNNER_TEMP/no-gateways.yaml"
+          refuse "set gateways to at least one entry" \
+            helm template chart-ci "$CHART" -f "$prod" -f "$RUNNER_TEMP/no-gateways.yaml"
+          refuse "below drainDeadlineSecs" \
+            helm template chart-ci "$CHART" -f "$prod" --set terminationGracePeriodSeconds=10
+
+          refuse "hostNetwork is off" \
+            helm template chart-ci "$CHART" -f "$prod" --set hostNetwork=false
+          renders "the namespace the splice address needs" \
+            helm template chart-ci "$CHART" -f "$prod" --set hostNetwork=true
+
+          on=(--set podDisruptionBudget.enabled=true)
+          refuse "allows no eviction at all" \
+            helm template chart-ci "$CHART" -f "$prod" "${on[@]}" --set podDisruptionBudget.maxUnavailable=0
+          refuse "allows no eviction at all" \
+            helm template chart-ci "$CHART" -f "$prod" "${on[@]}" --set 'podDisruptionBudget.maxUnavailable=0%'
+          refuse "neither a pod count nor a percentage" \
+            helm template chart-ci "$CHART" -f "$prod" "${on[@]}" --set 'podDisruptionBudget.maxUnavailable=abc'
+          refuse "cannot be negative" \
+            helm template chart-ci "$CHART" -f "$prod" "${on[@]}" --set podDisruptionBudget.maxUnavailable=-1
+
+          renders "a budget that allows one eviction" \
+            helm template chart-ci "$CHART" -f "$prod" "${on[@]}" --set podDisruptionBudget.maxUnavailable=1
+          renders "a percentage budget" \
+            helm template chart-ci "$CHART" -f "$prod" "${on[@]}" --set 'podDisruptionBudget.maxUnavailable=25%'
+
+          for bad in 10.0.0.5:22 127.999.1.1:22 127.0.0.1:65536 127.0.0.1:0 localhost:22 127.0.0.1.5:22; do
+            refuse "/spliceAddr" \
+              helm lint "$CHART" -f "$prod" --set "spliceAddr=$bad"
+          done
+          for good in 127.0.0.1:22 127.255.255.254:2222 '[::1]:22' '[0:0:0:0:0:0:0:1]:22'; do
+            renders "the splice address $good, which the binary parses and accepts" \
+              helm template chart-ci "$CHART" -f "$prod" --set "spliceAddr=$good"
+          done
+          refuse "/image/digest" \
+            helm lint "$CHART" -f "$prod" --set image.digest=sha256:abc
+
+      - name: Assert the chart and the image agree on the runtime uid
+        run: |
+          set -euo pipefail
+          dockerfile=deploy/Dockerfile
+
+          line=$(grep -E '^USER[[:space:]]' "$dockerfile" | tail -1 || true)
+          [ -n "$line" ] || {
+            echo "::error::$dockerfile declares no USER, so the image runs as root and runAsNonRoot has nothing to enforce"
+            exit 1
+          }
+          spec=$(printf '%s' "${line#USER }" | tr -d '[:space:]')
+          img_uid=${spec%%:*}
+          img_gid=${spec#*:}
+          [ "$img_gid" = "$spec" ] && img_gid=""
+
+          case "$img_uid" in
+            ''|*[!0-9]*)
+              echo "::error::$dockerfile has USER $spec, which is not numeric. Kubernetes runAsNonRoot cannot enforce a named user without an /etc/passwd lookup in the image. Make the Dockerfile numeric; do not put the name in the chart."
+              exit 1 ;;
+          esac
+          echo "$dockerfile: USER $spec"
+
+          out="$RUNNER_TEMP/uid-check.yaml"
+          helm template chart-ci "$CHART" -f "$CHART/ci/production-values.yaml" > "$out"
+
+          check() {
+            local field="$1" want="$2" got n
+            got=$(grep -oE "^[[:space:]]*$field:[[:space:]]*[0-9]+" "$out" | grep -oE '[0-9]+$' | sort -u)
+            n=$(printf '%s' "$got" | grep -c . || true)
+            if [ -z "$want" ]; then
+              [ "$n" -eq 0 ] || echo "note: chart sets $field=$(echo $got) and $dockerfile names no group"
+              return 0
+            fi
+            [ "$n" -eq 1 ] || {
+              echo "::error::the render declares $n distinct numeric $field values ($(echo $got)); expected exactly one"
+              exit 1
+            }
+            [ "$got" = "$want" ] || {
+              echo "::error::chart $field is $got but $dockerfile has $spec. runAsUser wins at runtime, so the image's own USER is the one that quietly stops describing what runs."
+              exit 1
+            }
+            echo "chart $field = $got"
+          }
+          check runAsUser "$img_uid"
+          check runAsGroup "$img_gid"
+          check fsGroup "$img_gid"
+
+      - name: helm package
+        run: |
+          set -euo pipefail
+          helm package "$CHART" -d "$RUNNER_TEMP/packaged"
+          ls -l "$RUNNER_TEMP/packaged"
